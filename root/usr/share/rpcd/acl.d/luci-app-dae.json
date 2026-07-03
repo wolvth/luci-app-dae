@@ -1,0 +1,28 @@
+{
+    "luci-app-dae": {
+        "description": "Grant access to dae LuCI procedures",
+        "read": {
+            "ubus": {
+                "luci.dae": [
+                    "getInitStatus",
+                    "validateConfig",
+                    "checkKernelCompat",
+                    "getProcessStats"
+                ]
+            },
+            "uci": [
+                "dae"
+            ]
+        },
+        "write": {
+            "ubus": {
+                "luci.dae": [
+                    "setInitAction"
+                ]
+            },
+            "uci": [
+                "dae"
+            ]
+        }
+    }
+}

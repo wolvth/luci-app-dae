@@ -1,0 +1,384 @@
+#!/bin/sh
+# rpcd backend for luci-app-dae
+# Provides ubus methods for the LuCI web interface
+
+. /usr/share/libubox/jshn.sh
+
+DAE_BIN="/usr/bin/dae"
+STATS_FILE="/tmp/dae-stats-prev"
+CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
+NUM_CPU=$(nproc 2>/dev/null || echo 1)
+
+# ── Helper: get dae PID ────────────────────────────────────────────
+get_dae_pid() {
+    pidof dae 2>/dev/null | awk '{print $1}'
+}
+
+# ── getInitStatus ──────────────────────────────────────────────────
+# Returns: running, pid, version, config_file, enabled, config_valid
+getInitStatus() {
+    local pid running version config_file enabled config_valid
+
+    pid=$(get_dae_pid)
+    running="false"
+    config_valid="false"
+
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+        running="true"
+    fi
+
+    # Get dae version
+    version=""
+    if [ -x "$DAE_BIN" ]; then
+        version=$("$DAE_BIN" version 2>/dev/null | head -1 | awk '{print $NF}')
+    fi
+
+    # Get config file path from UCI
+    config_file=$(uci -q get dae.settings.config_file)
+    config_file="${config_file:-/etc/dae/config.dae}"
+
+    # Enabled state
+    enabled=$(uci -q get dae.settings.enabled)
+    enabled="${enabled:-1}"
+
+    # Validate config
+    if [ -x "$DAE_BIN" ] && [ -f "$config_file" ]; then
+        if "$DAE_BIN" validate -c "$config_file" >/dev/null 2>&1; then
+            config_valid="true"
+        fi
+    fi
+
+    json_init
+    json_add_boolean "running" "$running"
+    json_add_string "pid" "${pid:-}"
+    json_add_string "version" "${version:-unknown}"
+    json_add_string "config_file" "$config_file"
+    json_add_boolean "enabled" "$([ "$enabled" = "1" ] && echo true || echo false)"
+    json_add_boolean "config_valid" "$config_valid"
+    json_dump
+}
+
+# ── setInitAction ──────────────────────────────────────────────────
+# Actions: start, stop, restart, reload_config (save-only), update
+setInitAction() {
+    local action="$1"
+    local result success message
+
+    success="true"
+    message=""
+
+    case "$action" in
+        start)
+            if ! /etc/init.d/dae validate >/dev/null 2>&1; then
+                /etc/init.d/dae start >/dev/null 2>&1
+                message="Started dae"
+            else
+                # Validation failed, still try to start
+                /etc/init.d/dae start >/dev/null 2>&1
+                message="Started dae (validation warning)"
+            fi
+            ;;
+        stop)
+            /etc/init.d/dae stop >/dev/null 2>&1
+            message="Stopped dae"
+            ;;
+        restart)
+            /etc/init.d/dae restart >/dev/null 2>&1
+            message="Restarted dae"
+            ;;
+        reload_config)
+            # Save-only: reload config without restarting the service
+            config_file=$(uci -q get dae.settings.config_file)
+            config_file="${config_file:-/etc/dae/config.dae}"
+            if [ -x "$DAE_BIN" ] && [ -f "$config_file" ]; then
+                if "$DAE_BIN" validate -c "$config_file" >/dev/null 2>&1; then
+                    message="Configuration saved (service not restarted)"
+                else
+                    success="false"
+                    message="Configuration has errors; save aborted"
+                fi
+            else
+                message="Configuration saved"
+            fi
+            ;;
+        update)
+            # Version-aware update routing
+            local ver
+            ver=$("$DAE_BIN" version 2>/dev/null | head -1 | awk '{print $NF}')
+
+            # Check if version is unstable/dev/nightly/snapshot/ci
+            case "$ver" in
+                unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
+                    # Route to GitHub Actions updater
+                    if [ -x /root/sh/updae_from_actions.sh ]; then
+                        /root/sh/updae_from_actions.sh >/dev/null 2>&1 &
+                        message="Update started (GitHub Actions build)"
+                    else
+                        success="false"
+                        message="Actions updater not found at /root/sh/updae_from_actions.sh"
+                    fi
+                    ;;
+                *)
+                    # Stable release: use installer.sh
+                    if [ -x /usr/share/dae/installer.sh ]; then
+                        /usr/share/dae/installer.sh install-prerelease >/dev/null 2>&1 &
+                        message="Update started (stable/prerelease)"
+                    else
+                        success="false"
+                        message="Installer not found at /usr/share/dae/installer.sh"
+                    fi
+                    ;;
+            esac
+            ;;
+        *)
+            success="false"
+            message="Unknown action: $action"
+            ;;
+    esac
+
+    json_init
+    json_add_boolean "success" "$success"
+    json_add_string "message" "$message"
+    json_dump
+}
+
+# ── validateConfig ─────────────────────────────────────────────────
+# Validates the dae config file
+validateConfig() {
+    local config_file valid output
+
+    config_file=$(uci -q get dae.settings.config_file)
+    config_file="${config_file:-/etc/dae/config.dae}"
+
+    valid="false"
+    output=""
+
+    if [ ! -f "$config_file" ]; then
+        output="Config file not found: $config_file"
+    elif [ ! -x "$DAE_BIN" ]; then
+        output="dae binary not found at $DAE_BIN"
+    else
+        output=$("$DAE_BIN" validate -c "$config_file" 2>&1)
+        if [ $? -eq 0 ]; then
+            valid="true"
+        fi
+    fi
+
+    json_init
+    json_add_boolean "valid" "$valid"
+    json_add_string "output" "$output"
+    json_dump
+}
+
+# ── checkKernelCompat ──────────────────────────────────────────────
+# Checks kernel version and eBPF/cgroup2 support
+checkKernelCompat() {
+    local kernel_ver ebpf_ok cgroup2_ok message
+
+    kernel_ver=$(uname -r)
+    ebpf_ok="false"
+    cgroup2_ok="false"
+    message=""
+
+    # Check kernel version >= 5.7 for best dae/eBPF support
+    local major minor
+    major=$(echo "$kernel_ver" | cut -d. -f1)
+    minor=$(echo "$kernel_ver" | cut -d. -f2)
+
+    if [ "$major" -gt 5 ] || { [ "$major" -eq 5 ] && [ "$minor" -ge 7 ]; }; then
+        ebpf_ok="true"
+    else
+        message="Kernel $kernel_ver detected; 5.7+ recommended for eBPF"
+    fi
+
+    # Check cgroup2
+    if mount | grep -q cgroup2; then
+        cgroup2_ok="true"
+    else
+        message="${message:+$message; }cgroup2 not mounted"
+    fi
+
+    [ -z "$message" ] && message="Kernel compatible"
+
+    json_init
+    json_add_string "kernel" "$kernel_ver"
+    json_add_boolean "ebpf_ok" "$ebpf_ok"
+    json_add_boolean "cgroup2_ok" "$cgroup2_ok"
+    json_add_string "message" "$message"
+    json_dump
+}
+
+# ── getProcessStats ────────────────────────────────────────────────
+# Returns instantaneous CPU%, RSS, VSZ, threads, uptime for the dae process.
+# Uses /proc/<pid>/stat deltas for accurate CPU measurement.
+getProcessStats() {
+    local pid cpu_pct rss_kb vsz_kb threads uptime_str
+    local cur_utime cur_stime cur_starttime cur_uptime
+    local prev_utime prev_stime prev_uptime
+    local delta_cpu delta_time
+
+    pid=$(get_dae_pid)
+    if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
+        json_init
+        json_add_boolean "running" "false"
+        json_add_string "cpu_percent" "0"
+        json_add_string "rss" "0"
+        json_add_string "vsz" "0"
+        json_add_string "threads" "0"
+        json_add_string "uptime" "0"
+        json_dump
+        return
+    fi
+
+    # ── Read /proc/pid/stat ────────────────────────────────────────
+    # Fields: ... 14=utime 15=stime ... 20=num_threads ... 22=starttime
+    local stat_line
+    stat_line=$(cat "/proc/$pid/stat" 2>/dev/null)
+    if [ -z "$stat_line" ]; then
+        json_init
+        json_add_boolean "running" "false"
+        json_dump
+        return
+    fi
+
+    # Parse fields (handle comm field which may contain spaces/parens)
+    # comm is field 2 in parens, find the last ')' then count from there
+    local after_comm
+    after_comm=$(echo "$stat_line" | sed 's/.*\) //')
+    local comm_fields
+    comm_fields=$(echo "$stat_line" | sed 's/.*(\(.*\)).*/\1/' | wc -w)
+
+    # After the comm field, fields restart at index 3
+    # 14-2=12 fields after comm start, so field 14 is at position 12 in after_comm
+    # Actually: stat fields after comm (which is field 2) start at field 3
+    # field 14 = position 12 in after_comm (14-2=12)
+    # field 15 = position 13
+    # field 20 = position 18
+    # field 22 = position 20
+    cur_utime=$(echo "$after_comm" | awk '{print $12}')
+    cur_stime=$(echo "$after_comm" | awk '{print $13}')
+    local num_threads=$(echo "$after_comm" | awk '{print $18}')
+    cur_starttime=$(echo "$after_comm" | awk '{print $20}')
+
+    # Current system uptime in clock ticks
+    cur_uptime=$(awk '{printf "%d", $1 * '"$CLK_TCK"'}' /proc/uptime 2>/dev/null)
+
+    # ── Read previous stats for delta calculation ──────────────────
+    prev_utime=0
+    prev_stime=0
+    prev_uptime=0
+
+    if [ -f "$STATS_FILE" ]; then
+        local prev_line
+        prev_line=$(cat "$STATS_FILE" 2>/dev/null)
+        if [ -n "$prev_line" ]; then
+            prev_utime=$(echo "$prev_line" | awk '{print $1}')
+            prev_stime=$(echo "$prev_line" | awk '{print $2}')
+            prev_uptime=$(echo "$prev_line" | awk '{print $3}')
+        fi
+    fi
+
+    # ── Save current stats for next call ───────────────────────────
+    echo "$cur_utime $cur_stime $cur_uptime" > "$STATS_FILE"
+
+    # ── Calculate CPU percentage ───────────────────────────────────
+    # delta_cpu = (cur_utime - prev_utime) + (cur_stime - prev_stime)
+    # delta_time = (cur_uptime - prev_uptime)
+    # cpu_pct = delta_cpu * 100 / delta_time / NUM_CPU
+    delta_cpu=$(( (cur_utime - prev_utime) + (cur_stime - prev_stime) ))
+    delta_time=$(( cur_uptime - prev_uptime ))
+
+    cpu_pct="0.0"
+    if [ "$delta_time" -gt 0 ] 2>/dev/null; then
+        cpu_pct=$(awk "BEGIN {printf \"%.1f\", $delta_cpu * 100 / $delta_time / $NUM_CPU}")
+    fi
+
+    # Clamp negative (first call or counter wrap)
+    case "$cpu_pct" in
+        -*) cpu_pct="0.0" ;;
+    esac
+
+    # ── Read VmRSS and VmSize from /proc/pid/status ────────────────
+    rss_kb=0
+    vsz_kb=0
+    if [ -f "/proc/$pid/status" ]; then
+        rss_kb=$(grep '^VmRSS:' "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
+        vsz_kb=$(grep '^VmSize:' "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
+    fi
+    rss_kb="${rss_kb:-0}"
+    vsz_kb="${vsz_kb:-0}"
+
+    # Convert to human-readable MB
+    local rss_mb vsz_mb
+    rss_mb=$(awk "BEGIN {printf \"%.1f\", $rss_kb / 1024}")
+    vsz_mb=$(awk "BEGIN {printf \"%.1f\", $vsz_kb / 1024}")
+
+    # ── Calculate uptime ───────────────────────────────────────────
+    # uptime_seconds = (system_uptime_ticks - starttime) / CLK_TCK
+    local sys_uptime_sec
+    sys_uptime_sec=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)
+    local proc_start_sec=$((cur_starttime / CLK_TCK))
+    local uptime_sec=$((sys_uptime_sec - proc_start_sec))
+
+    # Format uptime
+    if [ "$uptime_sec" -lt 0 ] 2>/dev/null; then
+        uptime_sec=0
+    fi
+
+    local days hours minutes
+    days=$((uptime_sec / 86400))
+    hours=$(( (uptime_sec % 86400) / 3600 ))
+    minutes=$(( (uptime_sec % 3600) / 60 ))
+
+    if [ "$days" -gt 0 ]; then
+        uptime_str="${days}d ${hours}h"
+    elif [ "$hours" -gt 0 ]; then
+        uptime_str="${hours}h ${minutes}m"
+    else
+        uptime_str="${minutes}m"
+    fi
+
+    # ── Output ─────────────────────────────────────────────────────
+    json_init
+    json_add_boolean "running" "true"
+    json_add_string "pid" "$pid"
+    json_add_string "cpu_percent" "$cpu_pct"
+    json_add_string "rss" "$rss_mb"
+    json_add_string "vsz" "$vsz_mb"
+    json_add_string "threads" "${num_threads:-0}"
+    json_add_string "uptime" "$uptime_str"
+    json_add_string "cpu_cores" "$NUM_CPU"
+    json_dump
+}
+
+# ── Main dispatch ──────────────────────────────────────────────────
+case "$1" in
+    list)
+        echo '{"getInitStatus": {}, "setInitAction": {"action": "string"}, "validateConfig": {}, "checkKernelCompat": {}, "getProcessStats": {}}'
+        ;;
+    call)
+        case "$2" in
+            getInitStatus)
+                getInitStatus
+                ;;
+            setInitAction)
+                json_load "$3"
+                json_get_var action action
+                setInitAction "$action"
+                ;;
+            validateConfig)
+                validateConfig
+                ;;
+            checkKernelCompat)
+                checkKernelCompat
+                ;;
+            getProcessStats)
+                getProcessStats
+                ;;
+            *)
+                echo '{"error": "Unknown method"}'
+                exit 1
+                ;;
+        esac
+        ;;
+esac

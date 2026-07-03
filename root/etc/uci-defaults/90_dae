@@ -1,0 +1,38 @@
+#!/bin/sh
+# UCI defaults for luci-app-dae — runs on first boot
+
+# Ensure the config section exists
+if ! uci get dae.settings >/dev/null 2>&1; then
+    uci set dae.settings=settings
+    uci set dae.settings.enabled='1'
+    uci set dae.settings.config_file='/etc/dae/config.dae'
+    uci set dae.settings.disable_waiting_network='0'
+    uci set dae.settings.enable_dae_log='1'
+    uci set dae.settings.logfile_maxsize='1'
+    uci commit dae
+fi
+
+# Ensure /etc/dae directory exists
+mkdir -p /etc/dae
+
+# Create default config if missing
+if [ ! -f /etc/dae/config.dae ]; then
+    cat > /etc/dae/config.dae <<'CFG'
+global {
+    log_level: info
+    tproxy_port: 12345
+    lan_interface: br-lan
+    wan_interface: auto
+    tcp_check_url: http://cp.cloudflare.com
+    udp_check_dns: dns.google:53
+    check_interval: 30
+    dial_mode: domain++
+}
+CFG
+fi
+
+# Set proper permissions
+chmod 0600 /etc/dae/config.dae 2>/dev/null
+chown root:root /etc/dae/config.dae 2>/dev/null
+
+exit 0

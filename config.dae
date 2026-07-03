@@ -1,0 +1,79 @@
+# Example dae configuration file
+# See https://github.com/daeuniverse/dae for full documentation
+
+global {
+    # Log level: error, warn, info, debug
+    log_level: info
+
+    # Listening port for transparent proxy (tproxy mode)
+    tproxy_port: 12345
+
+    # LAN interface(s) to bind to
+    # List all LAN interfaces that dae should proxy traffic for
+    lan_interface: br-lan
+
+    # WAN interface(s) for outbound traffic
+    # Auto-detect or specify manually
+    wan_interface: auto
+
+    # TCP/UDP check interval for node health
+    tcp_check_url: http://cp.cloudflare.com
+    udp_check_dns: dns.google:53
+
+    # Check interval (seconds)
+    check_interval: 30
+
+    # Dial mode: ip, domain, domain++
+    # ip: proxy by IP (faster, less flexible)
+    # domain: proxy by domain (moderate)
+    # domain++: proxy by domain with full sniffing
+    dial_mode: domain++
+
+    # Enable sniffing for TLS/QUIC/HTTP
+    sniffing_timeout: 100ms
+
+    # Mark for iptables/nftables routing
+    mark: 0x0001
+
+    # Auto config Linux kernel parameters
+    auto_config_kernel_parameter: true
+
+    # Enable eBPF for performance
+    enable_ebpf: true
+}
+
+# Subscription and node configuration
+# Uncomment and configure your subscription or nodes below:
+
+# subscription {
+#     my_sub: 'https://example.com/subscription-url'
+# }
+
+# node {
+#     my_node: 'trojan://password@example.com:443?sni=example.com&skip-cert-verify=false'
+# }
+
+# Routing rules (example)
+# group {
+#     proxy {
+#         # Use all nodes with health checking
+#         policy: min_moving_average
+#         # filter: name(keyword: 'HK') | name(keyword: 'SG')
+#     }
+#     direct {
+#         policy: direct
+#     }
+# }
+#
+# routing {
+#     # Direct traffic to Chinese IPs and domains
+#     pname(NetworkManager, systemd-resolved) -> direct
+#     dip(geoip:cn) -> direct
+#     ddomain(geosite:cn) -> direct
+#
+#     # Block ads (optional)
+#     # ddomain(geosite:category-ads-all) -> block
+#
+#     # Everything else through proxy
+#     fallback: proxy
+# }
