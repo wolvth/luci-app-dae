@@ -1,384 +1,382 @@
 #!/bin/sh
-# rpcd backend for luci-app-dae
-# Provides ubus methods for the LuCI web interface
 
+readonly NAME="dae"
+readonly PROG="/usr/bin/dae"
+readonly CONF="/etc/dae/config.dae"
+readonly LOG="/var/log/dae/dae.log"
+readonly INSTALLER="/usr/share/dae/installer.sh"
+readonly GEO_LOCK="/var/run/dae-geo-update.lock"
+readonly DAE_LOCK="/var/run/dae-update.lock"
+readonly GEOIP="/usr/share/dae/geoip.dat"
+readonly GEOSITE="/usr/share/dae/geosite.dat"
+readonly DAE_FAIL="${DAE_LOCK}.failed"
+readonly GEO_FAIL="${GEO_LOCK}.failed"
+
+. /lib/functions.sh
 . /usr/share/libubox/jshn.sh
 
-DAE_BIN="/usr/bin/dae"
-STATS_FILE="/tmp/dae-stats-prev"
-CLK_TCK=$(getconf CLK_TCK 2>/dev/null || echo 100)
-NUM_CPU=$(nproc 2>/dev/null || echo 1)
+is_enabled() { "/etc/init.d/${1}" enabled; }
+is_running() {
+	[ "$(ubus call service list "{ 'name': '$1' }" | \
+		jsonfilter -q -e "@['$1'].instances[*].running" | uniq)" = 'true' ]
+}
+get_version() { "$PROG" --version 2>/dev/null | awk 'NR==1{print $3}'; }
+print_json_bool() { json_init; json_add_boolean "$1" "$2"; json_dump; json_cleanup; }
 
-# ── Helper: get dae PID ────────────────────────────────────────────
-get_dae_pid() {
-    pidof dae 2>/dev/null | awk '{print $1}'
+# ── 新增：进程资源监控 ────────────────────────────────────────
+get_process_stats() {
+	local pid rss_kb vm_kb cpu_pct uptime_str threads
+	pid="$(pidof dae 2>/dev/null | awk '{print $1}')"
+
+	if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
+		json_init
+		json_add_boolean 'running' '0'
+		json_add_string 'cpu_percent' '0'
+		json_add_string 'mem_rss_kb' '0'
+		json_add_string 'mem_rss_mb' '0'
+		json_add_string 'mem_vsz_kb' '0'
+		json_add_string 'mem_vsz_mb' '0'
+		json_add_string 'threads' '0'
+		json_add_string 'uptime' '-'
+		json_add_int 'pid' 0
+		json_dump
+		json_cleanup
+		return
+	fi
+
+	local stat_fields clk_tck
+	clk_tck="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+	local prev_file="/tmp/dae-stats-prev"
+
+	stat_fields="$(cat /proc/$pid/stat 2>/dev/null)"
+	if [ -n "$stat_fields" ]; then
+		local utime stime num_threads start_time system_uptime
+		utime="$(echo "$stat_fields" | awk '{print $14}')"
+		stime="$(echo "$stat_fields" | awk '{print $15}')"
+		num_threads="$(echo "$stat_fields" | awk '{print $20}')"
+		start_time="$(echo "$stat_fields" | awk '{print $22}')"
+		system_uptime="$(cat /proc/uptime 2>/dev/null | awk '{printf "%d", $1}')"
+
+		# 瞬时 CPU：本次采样 - 上次采样
+		local prev_utime prev_stime prev_uptime
+		if [ -f "$prev_file" ]; then
+			prev_utime="$(awk '{print $1}' "$prev_file")"
+			prev_stime="$(awk '{print $2}' "$prev_file")"
+			prev_uptime="$(awk '{print $3}' "$prev_file")"
+		fi
+		prev_utime="${prev_utime:-0}"
+		prev_stime="${prev_stime:-0}"
+		prev_uptime="${prev_uptime:-0}"
+
+		# 保存本次采样
+		printf '%s %s %s\n' "$utime" "$stime" "$system_uptime" > "$prev_file"
+
+		local delta_cpu delta_time num_cpu
+		delta_cpu=$(( (utime - prev_utime) + (stime - prev_stime) ))
+		delta_time=$(( (system_uptime - prev_uptime) * clk_tck ))
+		num_cpu=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo 1)
+		if [ "$delta_time" -gt 0 ] && [ "$prev_uptime" -gt 0 ]; then
+			# 总 CPU% = 单核% / 核心数，与 top/btop 一致
+			cpu_pct=$(( delta_cpu * 100 / delta_time / num_cpu ))
+			[ "$cpu_pct" -gt 100 ] && cpu_pct=100
+			[ "$cpu_pct" -lt 0 ] && cpu_pct=0
+		else
+			cpu_pct=0
+		fi
+
+		# 运行时间
+		if [ "$start_time" -gt 0 ] && [ "$system_uptime" -gt 0 ]; then
+			local run_secs days hours mins secs
+			run_secs=$((system_uptime - start_time / clk_tck))
+			[ "$run_secs" -lt 0 ] && run_secs=0
+			days=$((run_secs / 86400))
+			hours=$(((run_secs % 86400) / 3600))
+			mins=$(((run_secs % 3600) / 60))
+			secs=$((run_secs % 60))
+			if [ "$days" -gt 0 ]; then
+				uptime_str="${days}d ${hours}h ${mins}m"
+			elif [ "$hours" -gt 0 ]; then
+				uptime_str="${hours}h ${mins}m ${secs}s"
+			else
+				uptime_str="${mins}m ${secs}s"
+			fi
+		else
+			uptime_str="-"
+		fi
+		threads="${num_threads:-0}"
+	else
+		cpu_pct=0; threads=0; uptime_str="-"
+	fi
+
+	# 内存
+	rss_kb=0; vm_kb=0
+	if [ -f "/proc/$pid/status" ]; then
+		rss_kb="$(awk '/^VmRSS:/{print $2}' /proc/$pid/status 2>/dev/null || echo 0)"
+		vm_kb="$(awk '/^VmSize:/{print $2}' /proc/$pid/status 2>/dev/null || echo 0)"
+	fi
+	rss_kb="${rss_kb:-0}"; vm_kb="${vm_kb:-0}"
+	local rss_mb vm_mb
+	rss_mb="$((rss_kb / 1024))"
+	vm_mb="$((vm_kb / 1024))"
+
+	json_init
+	json_add_boolean 'running' '1'
+	json_add_int 'pid' "$pid"
+	json_add_string 'cpu_percent' "$cpu_pct"
+	json_add_string 'mem_rss_kb' "$rss_kb"
+	json_add_string 'mem_rss_mb' "$rss_mb"
+	json_add_string 'mem_vsz_kb' "$vm_kb"
+	json_add_string 'mem_vsz_mb' "$vm_mb"
+	json_add_string 'threads' "$threads"
+	json_add_string 'uptime' "$uptime_str"
+	json_dump
+	json_cleanup
 }
 
-# ── getInitStatus ──────────────────────────────────────────────────
-# Returns: running, pid, version, config_file, enabled, config_valid
-getInitStatus() {
-    local pid running version config_file enabled config_valid
+# ── 原有函数 ──────────────────────────────────────────────────
 
-    pid=$(get_dae_pid)
-    running="false"
-    config_valid="false"
-
-    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
-        running="true"
-    fi
-
-    # Get dae version
-    version=""
-    if [ -x "$DAE_BIN" ]; then
-        version=$("$DAE_BIN" version 2>/dev/null | head -1 | awk '{print $NF}')
-    fi
-
-    # Get config file path from UCI
-    config_file=$(uci -q get dae.settings.config_file)
-    config_file="${config_file:-/etc/dae/config.dae}"
-
-    # Enabled state
-    enabled=$(uci -q get dae.settings.enabled)
-    enabled="${enabled:-1}"
-
-    # Validate config
-    if [ -x "$DAE_BIN" ] && [ -f "$config_file" ]; then
-        if "$DAE_BIN" validate -c "$config_file" >/dev/null 2>&1; then
-            config_valid="true"
-        fi
-    fi
-
-    json_init
-    json_add_boolean "running" "$running"
-    json_add_string "pid" "${pid:-}"
-    json_add_string "version" "${version:-unknown}"
-    json_add_string "config_file" "$config_file"
-    json_add_boolean "enabled" "$([ "$enabled" = "1" ] && echo true || echo false)"
-    json_add_boolean "config_valid" "$config_valid"
-    json_dump
+get_init_status() {
+	local name="$1"
+	local version
+	version="$(get_version)"
+	json_init
+	json_add_object "$name"
+	if is_enabled "$name"; then
+		json_add_boolean 'enabled' '1'
+	else
+		json_add_boolean 'enabled' '0'
+	fi
+	if is_running "$name"; then
+		json_add_boolean 'running' '1'
+	else
+		json_add_boolean 'running' '0'
+	fi
+	json_add_string 'version' "$version"
+	if [ -f "$GEO_LOCK" ]; then
+		json_add_boolean 'geo_updating' '1'
+	else
+		json_add_boolean 'geo_updating' '0'
+	fi
+	if [ -f "$DAE_LOCK" ]; then
+		json_add_boolean 'dae_updating' '1'
+	else
+		json_add_boolean 'dae_updating' '0'
+	fi
+	local dae_failed=0 geo_failed=0
+	[ -f "$DAE_FAIL" ] && dae_failed=1
+	[ -f "$GEO_FAIL" ] && geo_failed=1
+	json_add_boolean 'dae_update_failed' "$dae_failed"
+	json_add_boolean 'geo_update_failed' "$geo_failed"
+	local geoip_mtime=0 geosite_mtime=0
+	[ -f "$GEOIP" ]    && geoip_mtime="$(date -r "$GEOIP" +%s 2>/dev/null || echo 0)"
+	[ -f "$GEOSITE" ]  && geosite_mtime="$(date -r "$GEOSITE" +%s 2>/dev/null || echo 0)"
+	json_add_int 'geoip_mtime' "$geoip_mtime"
+	json_add_int 'geosite_mtime' "$geosite_mtime"
+	json_close_object
+	json_dump
+	json_cleanup
 }
 
-# ── setInitAction ──────────────────────────────────────────────────
-# Actions: start, stop, restart, reload_config (save-only), update
-setInitAction() {
-    local action="$1"
-    local result success message
-
-    success="true"
-    message=""
-
-    case "$action" in
-        start)
-            if ! /etc/init.d/dae validate >/dev/null 2>&1; then
-                /etc/init.d/dae start >/dev/null 2>&1
-                message="Started dae"
-            else
-                # Validation failed, still try to start
-                /etc/init.d/dae start >/dev/null 2>&1
-                message="Started dae (validation warning)"
-            fi
-            ;;
-        stop)
-            /etc/init.d/dae stop >/dev/null 2>&1
-            message="Stopped dae"
-            ;;
-        restart)
-            /etc/init.d/dae restart >/dev/null 2>&1
-            message="Restarted dae"
-            ;;
-        reload_config)
-            # Save-only: reload config without restarting the service
-            config_file=$(uci -q get dae.settings.config_file)
-            config_file="${config_file:-/etc/dae/config.dae}"
-            if [ -x "$DAE_BIN" ] && [ -f "$config_file" ]; then
-                if "$DAE_BIN" validate -c "$config_file" >/dev/null 2>&1; then
-                    message="Configuration saved (service not restarted)"
-                else
-                    success="false"
-                    message="Configuration has errors; save aborted"
-                fi
-            else
-                message="Configuration saved"
-            fi
-            ;;
-        update)
-            # Version-aware update routing
-            local ver
-            ver=$("$DAE_BIN" version 2>/dev/null | head -1 | awk '{print $NF}')
-
-            # Check if version is unstable/dev/nightly/snapshot/ci
-            case "$ver" in
-                unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
-                    # Route to GitHub Actions updater
-                    if [ -x /root/sh/updae_from_actions.sh ]; then
-                        /root/sh/updae_from_actions.sh >/dev/null 2>&1 &
-                        message="Update started (GitHub Actions build)"
-                    else
-                        success="false"
-                        message="Actions updater not found at /root/sh/updae_from_actions.sh"
-                    fi
-                    ;;
-                *)
-                    # Stable release: use installer.sh
-                    if [ -x /usr/share/dae/installer.sh ]; then
-                        /usr/share/dae/installer.sh install-prerelease >/dev/null 2>&1 &
-                        message="Update started (stable/prerelease)"
-                    else
-                        success="false"
-                        message="Installer not found at /usr/share/dae/installer.sh"
-                    fi
-                    ;;
-            esac
-            ;;
-        *)
-            success="false"
-            message="Unknown action: $action"
-            ;;
-    esac
-
-    json_init
-    json_add_boolean "success" "$success"
-    json_add_string "message" "$message"
-    json_dump
+set_init_action() {
+	local name="$1" action="$2"
+	[ "$name" = "$NAME" ] || { print_json_bool "result" '0'; return; }
+	case "$action" in
+		enable|disable|start|stop|restart)
+			if /etc/init.d/"$name" "$action" >/dev/null 2>&1; then
+				print_json_bool "result" '1'
+			else
+				print_json_bool "result" '0'
+			fi
+			;;
+		# --- 只保存配置，不触发 dae reload ---
+		reload_config)
+			print_json_bool "result" "1"
+			;;
+		update)
+			if [ -f "$DAE_LOCK" ]; then
+				print_json_bool "result" '0'; return
+			fi
+			rm -f "$DAE_FAIL"
+			( touch "$DAE_LOCK"
+			  mkdir -p "$(dirname "$LOG")"
+			  # ---- 版本感知更新逻辑 ----
+			  current_ver=$("$PROG" --version 2>/dev/null | awk 'NR==1{print $3}')
+			  case "$current_ver" in
+			      unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
+			          # Actions 构建版本 → 自定义脚本
+			          ACTIONS_SCRIPT="/root/sh/updae_from_actions.sh"
+			          if [ -f "$ACTIONS_SCRIPT" ] && [ -x "$ACTIONS_SCRIPT" ]; then
+			              sh "$ACTIONS_SCRIPT" >> "$LOG" 2>&1
+			          else
+			              echo "[update] Actions 版本但 $ACTIONS_SCRIPT 不存在" >> "$LOG"
+			              echo "[update] 回退到 installer.sh" >> "$LOG"
+			              sh "$INSTALLER" install-prerelease >> "$LOG" 2>&1
+			          fi
+			          ;;
+			      *)
+			          # 正常版本 → 官方 installer
+			          sh "$INSTALLER" install-prerelease >> "$LOG" 2>&1
+			          ;;
+			  esac
+			  rc=$?
+			  rm -f "$DAE_LOCK"
+			  [ $rc -eq 0 ] || touch "$DAE_FAIL" ) &
+			print_json_bool "result" '1'
+			;;
+		update_geo)
+			if [ -f "$GEO_LOCK" ]; then
+				print_json_bool "result" '0'; return
+			fi
+			rm -f "$GEO_FAIL"
+			( touch "$GEO_LOCK"
+			  mkdir -p "$(dirname "$LOG")"
+			  sh "$INSTALLER" update-geoip  >> "$LOG" 2>&1
+			  rc=$?
+			  if [ $rc -eq 0 ]; then
+				  sh "$INSTALLER" update-geosite >> "$LOG" 2>&1
+				  rc=$?
+			  fi
+			  rm -f "$GEO_LOCK"
+			  [ $rc -eq 0 ] || touch "$GEO_FAIL" ) &
+			print_json_bool "result" '1'
+			;;
+		*)
+			print_json_bool "result" '0'
+			;;
+	esac
 }
 
-# ── validateConfig ─────────────────────────────────────────────────
-# Validates the dae config file
-validateConfig() {
-    local config_file valid output
-
-    config_file=$(uci -q get dae.settings.config_file)
-    config_file="${config_file:-/etc/dae/config.dae}"
-
-    valid="false"
-    output=""
-
-    if [ ! -f "$config_file" ]; then
-        output="Config file not found: $config_file"
-    elif [ ! -x "$DAE_BIN" ]; then
-        output="dae binary not found at $DAE_BIN"
-    else
-        output=$("$DAE_BIN" validate -c "$config_file" 2>&1)
-        if [ $? -eq 0 ]; then
-            valid="true"
-        fi
-    fi
-
-    json_init
-    json_add_boolean "valid" "$valid"
-    json_add_string "output" "$output"
-    json_dump
+validate_config() {
+	local content="$1" out rc tmp
+	if [ ! -f "$PROG" ]; then
+		json_init
+		json_add_boolean 'valid' '0'
+		json_add_string 'message' 'dae binary not found'
+		json_dump; json_cleanup; return
+	fi
+	tmp="/tmp/dae-validate-$$.dae"
+	if [ -n "$content" ]; then
+		printf '%s' "$content" > "$tmp"
+	else
+		cp "$CONF" "$tmp" 2>/dev/null
+	fi
+	chmod 600 "$tmp"
+	out="$("$PROG" validate -c "$tmp" 2>&1)"
+	rc=$?
+	rm -f "$tmp"
+	json_init
+	if [ $rc -eq 0 ]; then
+		json_add_boolean 'valid' '1'
+		json_add_string 'message' 'Config is valid'
+	else
+		json_add_boolean 'valid' '0'
+		json_add_string 'message' "$out"
+	fi
+	json_dump
+	json_cleanup
 }
 
-# ── checkKernelCompat ──────────────────────────────────────────────
-# Checks kernel version and eBPF/cgroup2 support
-checkKernelCompat() {
-    local kernel_ver ebpf_ok cgroup2_ok message
+check_kernel_compat() {
+	local kver kmaj kmin kver_ok
+	kver="$(uname -r | cut -d. -f1-2)"
+	kmaj="$(echo "$kver" | cut -d. -f1)"
+	kmin="$(echo "$kver" | cut -d. -f2)"
+	kver_ok=0
+	[ "$kmaj" -gt 5 ] && kver_ok=1
+	[ "$kmaj" -eq 5 ] && [ "$kmin" -ge 17 ] && kver_ok=1
 
-    kernel_ver=$(uname -r)
-    ebpf_ok="false"
-    cgroup2_ok="false"
-    message=""
+	sys_check() { [ -e "$1" ] && echo "1" || echo "0"; }
 
-    # Check kernel version >= 5.7 for best dae/eBPF support
-    local major minor
-    major=$(echo "$kernel_ver" | cut -d. -f1)
-    minor=$(echo "$kernel_ver" | cut -d. -f2)
+	kmod_check() {
+		lsmod 2>/dev/null | grep -q "^${1} " && echo "1" && return
+		[ -d "/sys/module/${1}" ] && echo "1" && return
+		find /lib/modules/"$(uname -r)" -name "${1}.ko" 2>/dev/null | grep -q . && echo "1" && return
+		echo "0"
+	}
 
-    if [ "$major" -gt 5 ] || { [ "$major" -eq 5 ] && [ "$minor" -ge 7 ]; }; then
-        ebpf_ok="true"
-    else
-        message="Kernel $kernel_ver detected; 5.7+ recommended for eBPF"
-    fi
-
-    # Check cgroup2
-    if mount | grep -q cgroup2; then
-        cgroup2_ok="true"
-    else
-        message="${message:+$message; }cgroup2 not mounted"
-    fi
-
-    [ -z "$message" ] && message="Kernel compatible"
-
-    json_init
-    json_add_string "kernel" "$kernel_ver"
-    json_add_boolean "ebpf_ok" "$ebpf_ok"
-    json_add_boolean "cgroup2_ok" "$cgroup2_ok"
-    json_add_string "message" "$message"
-    json_dump
+	json_init
+	json_add_string  "kernel_version"    "$(uname -r)"
+	json_add_boolean "kernel_version_ok" "$kver_ok"
+	json_add_int "BPF_SYSCALL"        "$(sys_check /sys/fs/bpf)"
+	json_add_int "DEBUG_INFO_BTF"     "$(sys_check /sys/kernel/btf/vmlinux)"
+	json_add_int "NET_CLS_BPF"        "$(kmod_check cls_bpf)"
+	json_add_int "NET_SCH_INGRESS"    "$(kmod_check sch_ingress)"
+	json_add_int "CGROUPS"            "$(sys_check /sys/fs/cgroup/cgroup.controllers)"
+	local kprobes_ok=0
+	[ -e /sys/kernel/tracing/kprobe_events ] && kprobes_ok=1
+	[ -e /sys/kernel/debug/tracing/kprobe_events ] && kprobes_ok=1
+	json_add_int "KPROBES" "$kprobes_ok"
+	json_add_int "kmod_veth"              "$(kmod_check veth)"
+	json_add_int "kmod_sched_bpf"         "$(kmod_check cls_bpf)"
+	json_add_int "kmod_sched_core"        "$(kmod_check sch_ingress)"
+	json_add_int "kmod_xdp_sockets_diag"  "$(kmod_check xsk_diag)"
+	local nft_bridge_ok=0
+	[ -d /sys/module/nft_bridge ] && nft_bridge_ok=1
+	ls /lib/modules/"$(uname -r)"/nft_*bridge*.ko >/dev/null 2>&1 && nft_bridge_ok=1
+	json_add_int "kmod_nft_bridge"        "$nft_bridge_ok"
+	local ip_forward=0
+	[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ] && ip_forward=1
+	json_add_boolean "ip_forward" "$ip_forward"
+	local nft_ok=0
+	command -v nft >/dev/null 2>&1 && nft_ok=1
+	json_add_boolean "nft" "$nft_ok"
+	local mem_free=0
+	mem_free="$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+	json_add_int "mem_free_kb" "$mem_free"
+	json_dump
+	json_cleanup
 }
 
-# ── getProcessStats ────────────────────────────────────────────────
-# Returns instantaneous CPU%, RSS, VSZ, threads, uptime for the dae process.
-# Uses /proc/<pid>/stat deltas for accurate CPU measurement.
-getProcessStats() {
-    local pid cpu_pct rss_kb vsz_kb threads uptime_str
-    local cur_utime cur_stime cur_starttime cur_uptime
-    local prev_utime prev_stime prev_uptime
-    local delta_cpu delta_time
-
-    pid=$(get_dae_pid)
-    if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
-        json_init
-        json_add_boolean "running" "false"
-        json_add_string "cpu_percent" "0"
-        json_add_string "rss" "0"
-        json_add_string "vsz" "0"
-        json_add_string "threads" "0"
-        json_add_string "uptime" "0"
-        json_dump
-        return
-    fi
-
-    # ── Read /proc/pid/stat ────────────────────────────────────────
-    # Fields: ... 14=utime 15=stime ... 20=num_threads ... 22=starttime
-    local stat_line
-    stat_line=$(cat "/proc/$pid/stat" 2>/dev/null)
-    if [ -z "$stat_line" ]; then
-        json_init
-        json_add_boolean "running" "false"
-        json_dump
-        return
-    fi
-
-    # Parse fields (handle comm field which may contain spaces/parens)
-    # comm is field 2 in parens, find the last ')' then count from there
-    local after_comm
-    after_comm=$(echo "$stat_line" | sed 's/.*\) //')
-    local comm_fields
-    comm_fields=$(echo "$stat_line" | sed 's/.*(\(.*\)).*/\1/' | wc -w)
-
-    # After the comm field, fields restart at index 3
-    # 14-2=12 fields after comm start, so field 14 is at position 12 in after_comm
-    # Actually: stat fields after comm (which is field 2) start at field 3
-    # field 14 = position 12 in after_comm (14-2=12)
-    # field 15 = position 13
-    # field 20 = position 18
-    # field 22 = position 20
-    cur_utime=$(echo "$after_comm" | awk '{print $12}')
-    cur_stime=$(echo "$after_comm" | awk '{print $13}')
-    local num_threads=$(echo "$after_comm" | awk '{print $18}')
-    cur_starttime=$(echo "$after_comm" | awk '{print $20}')
-
-    # Current system uptime in clock ticks
-    cur_uptime=$(awk '{printf "%d", $1 * '"$CLK_TCK"'}' /proc/uptime 2>/dev/null)
-
-    # ── Read previous stats for delta calculation ──────────────────
-    prev_utime=0
-    prev_stime=0
-    prev_uptime=0
-
-    if [ -f "$STATS_FILE" ]; then
-        local prev_line
-        prev_line=$(cat "$STATS_FILE" 2>/dev/null)
-        if [ -n "$prev_line" ]; then
-            prev_utime=$(echo "$prev_line" | awk '{print $1}')
-            prev_stime=$(echo "$prev_line" | awk '{print $2}')
-            prev_uptime=$(echo "$prev_line" | awk '{print $3}')
-        fi
-    fi
-
-    # ── Save current stats for next call ───────────────────────────
-    echo "$cur_utime $cur_stime $cur_uptime" > "$STATS_FILE"
-
-    # ── Calculate CPU percentage ───────────────────────────────────
-    # delta_cpu = (cur_utime - prev_utime) + (cur_stime - prev_stime)
-    # delta_time = (cur_uptime - prev_uptime)
-    # cpu_pct = delta_cpu * 100 / delta_time / NUM_CPU
-    delta_cpu=$(( (cur_utime - prev_utime) + (cur_stime - prev_stime) ))
-    delta_time=$(( cur_uptime - prev_uptime ))
-
-    cpu_pct="0.0"
-    if [ "$delta_time" -gt 0 ] 2>/dev/null; then
-        cpu_pct=$(awk "BEGIN {printf \"%.1f\", $delta_cpu * 100 / $delta_time / $NUM_CPU}")
-    fi
-
-    # Clamp negative (first call or counter wrap)
-    case "$cpu_pct" in
-        -*) cpu_pct="0.0" ;;
-    esac
-
-    # ── Read VmRSS and VmSize from /proc/pid/status ────────────────
-    rss_kb=0
-    vsz_kb=0
-    if [ -f "/proc/$pid/status" ]; then
-        rss_kb=$(grep '^VmRSS:' "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
-        vsz_kb=$(grep '^VmSize:' "/proc/$pid/status" 2>/dev/null | awk '{print $2}')
-    fi
-    rss_kb="${rss_kb:-0}"
-    vsz_kb="${vsz_kb:-0}"
-
-    # Convert to human-readable MB
-    local rss_mb vsz_mb
-    rss_mb=$(awk "BEGIN {printf \"%.1f\", $rss_kb / 1024}")
-    vsz_mb=$(awk "BEGIN {printf \"%.1f\", $vsz_kb / 1024}")
-
-    # ── Calculate uptime ───────────────────────────────────────────
-    # uptime_seconds = (system_uptime_ticks - starttime) / CLK_TCK
-    local sys_uptime_sec
-    sys_uptime_sec=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)
-    local proc_start_sec=$((cur_starttime / CLK_TCK))
-    local uptime_sec=$((sys_uptime_sec - proc_start_sec))
-
-    # Format uptime
-    if [ "$uptime_sec" -lt 0 ] 2>/dev/null; then
-        uptime_sec=0
-    fi
-
-    local days hours minutes
-    days=$((uptime_sec / 86400))
-    hours=$(( (uptime_sec % 86400) / 3600 ))
-    minutes=$(( (uptime_sec % 3600) / 60 ))
-
-    if [ "$days" -gt 0 ]; then
-        uptime_str="${days}d ${hours}h"
-    elif [ "$hours" -gt 0 ]; then
-        uptime_str="${hours}h ${minutes}m"
-    else
-        uptime_str="${minutes}m"
-    fi
-
-    # ── Output ─────────────────────────────────────────────────────
-    json_init
-    json_add_boolean "running" "true"
-    json_add_string "pid" "$pid"
-    json_add_string "cpu_percent" "$cpu_pct"
-    json_add_string "rss" "$rss_mb"
-    json_add_string "vsz" "$vsz_mb"
-    json_add_string "threads" "${num_threads:-0}"
-    json_add_string "uptime" "$uptime_str"
-    json_add_string "cpu_cores" "$NUM_CPU"
-    json_dump
-}
-
-# ── Main dispatch ──────────────────────────────────────────────────
 case "$1" in
-    list)
-        echo '{"getInitStatus": {}, "setInitAction": {"action": "string"}, "validateConfig": {}, "checkKernelCompat": {}, "getProcessStats": {}}'
-        ;;
-    call)
-        case "$2" in
-            getInitStatus)
-                getInitStatus
-                ;;
-            setInitAction)
-                json_load "$3"
-                json_get_var action action
-                setInitAction "$action"
-                ;;
-            validateConfig)
-                validateConfig
-                ;;
-            checkKernelCompat)
-                checkKernelCompat
-                ;;
-            getProcessStats)
-                getProcessStats
-                ;;
-            *)
-                echo '{"error": "Unknown method"}'
-                exit 1
-                ;;
-        esac
-        ;;
+	list)
+		json_init
+		json_add_object "getInitStatus"
+			json_add_string 'name' "name"
+		json_close_object
+		json_add_object "setInitAction"
+			json_add_string 'name' "name"
+			json_add_string 'action' "action"
+		json_close_object
+		json_add_object "validateConfig"
+			json_add_string 'content' "content"
+		json_close_object
+		json_add_object "checkKernelCompat"
+		json_close_object
+		json_add_object "getProcessStats"
+		json_close_object
+		json_dump
+		json_cleanup
+		;;
+	call)
+		case "$2" in
+			getInitStatus)
+				read -r input
+				json_load "$input"
+				json_get_var name 'name'
+				json_cleanup
+				get_init_status "$name"
+				;;
+			setInitAction)
+				read -r input
+				json_load "$input"
+				json_get_var name "name"
+				json_get_var action "action"
+				json_cleanup
+				set_init_action "$name" "$action"
+				;;
+			validateConfig)
+				read -r input
+				json_load "$input"
+				json_get_var content 'content'
+				json_cleanup
+				validate_config "$content"
+				;;
+			checkKernelCompat)
+				check_kernel_compat
+				;;
+			getProcessStats)
+				get_process_stats
+				;;
+		esac
+		;;
 esac
