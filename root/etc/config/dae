@@ -1,6 +1,0 @@
-config settings 'settings'
-    option enabled '1'
-    option config_file '/etc/dae/config.dae'
-    option disable_waiting_network '0'
-    option enable_dae_log '1'
-    option logfile_maxsize '1'
