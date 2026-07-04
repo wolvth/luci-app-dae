@@ -19,6 +19,7 @@ readonly GEO_FAIL="${GEO_LOCK}.failed"
 . /usr/share/libubox/jshn.sh
 
 # ── 确保目录和文件存在 ─────────────────────────────────────
+[ ! -f /etc/config/dae ] && touch /etc/config/dae
 ensure_directories() {
     [ ! -d "$LOG_DIR" ] && mkdir -p "$LOG_DIR"
     [ ! -d "$CONF_DIR" ] && mkdir -p "$CONF_DIR"
