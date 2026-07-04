@@ -114,7 +114,10 @@ var statsPoller = {
 		var rss = formatMem(s.mem_rss_kb, s.mem_rss_mb);
 		var threads = (s.threads || '0') + ' ' + _('threads');
 		var uptime = s.uptime || '-';
-		this.el.textContent = '  |  CPU ' + cpu + '  |  RSS ' + rss + '  |  ' + threads + '  |  ' + uptime;
+		this.el.innerHTML = '  |  CPU <b style="color:#3498db">' + cpu + '</b>' +
+			'  |  RSS <b style="color:#e67e22">' + rss + '</b>' +
+			'  |  <b style>' + threads + '</b>' +
+			'  |  <b style="color:#9b59b6">' + uptime + '</b>';
 	}
 };
 
