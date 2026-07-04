@@ -14,8 +14,6 @@ EXTRA_COMMANDS="reload_config"
 EXTRA_HELP="        reload_config   Reload $NAME config"
 
 start_service() {
-    config_load $NAME
-
     mkdir -p /var/log/dae
     $PROG validate -c $CONF >> $LOG 2>&1 || return 1
 
@@ -23,11 +21,17 @@ start_service() {
         procd_set_param command $PROG
         procd_append_param command run --logfile $LOG -c $CONF
 
-        local size
+        local size backups
         size=$(uci -q get ${NAME}.settings.logfile_maxsize)
-        size="${size:-1}"
+        size="${size:-3}"
         if [ -n "$size" ] && [ "$size" -gt 0 ]; then
             procd_append_param command --logfile-maxsize $size
+        fi
+
+        backups=$(uci -q get ${NAME}.settings.logfile_maxbackups)
+        backups="${backups:-1}"
+        if [ -n "$backups" ] && [ "$backups" -gt 0 ]; then
+            procd_append_param command --logfile-maxbackups $backups
         fi
 
         procd_set_param limits core="unlimited"
