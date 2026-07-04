@@ -93,6 +93,38 @@ check_arch() {
 ## ── Version helpers ──────────────────────────────────────────────────────────
 # POSIX version compare — no sort -V (not in busybox)
 # Returns: 0=equal  1=$1>$2  2=$1<$2
+ver_compare() {
+    # Returns: 0=equal  1=$1>$2  2=$1<$2
+    [ "$1" = "$2" ] && { echo 0; return; }
+
+    # dev/unstable builds always older than any proper release
+    case "$1" in
+        unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
+            echo 2; return ;;
+    esac
+    case "$2" in
+        unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
+            echo 1; return ;;
+    esac
+
+    # Strip v prefix, strip non-numeric suffixes (rc1, beta2, etc.)
+    v1="$(echo "$1" | sed 's/^v//;s/[a-zA-Z].*//' )"
+    v2="$(echo "$2" | sed 's/^v//;s/[a-zA-Z].*//' )"
+
+    a1="$(echo "$v1" | cut -d. -f1)"; a1="${a1:-0}"
+    b1="$(echo "$v1" | cut -d. -f2)"; b1="${b1:-0}"
+    c1="$(echo "$v1" | cut -d. -f3)"; c1="${c1:-0}"
+    a2="$(echo "$v2" | cut -d. -f1)"; a2="${a2:-0}"
+    b2="$(echo "$v2" | cut -d. -f2)"; b2="${b2:-0}"
+    c2="$(echo "$v2" | cut -d. -f3)"; c2="${c2:-0}"
+
+    for pair in "${a1}:${a2}" "${b1}:${b2}" "${c1}:${c2}"; do
+        n1="${pair%%:*}"; n2="${pair##*:}"
+        [ "$n1" -gt "$n2" ] 2>/dev/null && { echo 1; return; }
+        [ "$n1" -lt "$n2" ] 2>/dev/null && { echo 2; return; }
+    done
+    echo 0
+}
 
 check_local_version() {
     echo "${GREEN}[1/4] Checking local dae version...${RESET}"
@@ -521,35 +553,3 @@ if [ "$geosite_should_update" = 'yes' ]; then
     check_arch; get_download_urls
     download_geosite; update_geosite
 fi
-ver_compare() {
-    # Returns: 0=equal  1=$1>$2  2=$1<$2
-    [ "$1" = "$2" ] && { echo 0; return; }
-
-    # dev/unstable builds always older than any proper release
-    case "$1" in
-        unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
-            echo 2; return ;;
-    esac
-    case "$2" in
-        unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
-            echo 1; return ;;
-    esac
-
-    # Strip v prefix, strip non-numeric suffixes (rc1, beta2, etc.)
-    v1="$(echo "$1" | sed 's/^v//;s/[a-zA-Z].*//' )"
-    v2="$(echo "$2" | sed 's/^v//;s/[a-zA-Z].*//' )"
-
-    a1="$(echo "$v1" | cut -d. -f1)"; a1="${a1:-0}"
-    b1="$(echo "$v1" | cut -d. -f2)"; b1="${b1:-0}"
-    c1="$(echo "$v1" | cut -d. -f3)"; c1="${c1:-0}"
-    a2="$(echo "$v2" | cut -d. -f1)"; a2="${a2:-0}"
-    b2="$(echo "$v2" | cut -d. -f2)"; b2="${b2:-0}"
-    c2="$(echo "$v2" | cut -d. -f3)"; c2="${c2:-0}"
-
-    for pair in "${a1}:${a2}" "${b1}:${b2}" "${c1}:${c2}"; do
-        n1="${pair%%:*}"; n2="${pair##*:}"
-        [ "$n1" -gt "$n2" ] 2>/dev/null && { echo 1; return; }
-        [ "$n1" -lt "$n2" ] 2>/dev/null && { echo 2; return; }
-    done
-    echo 0
-}
