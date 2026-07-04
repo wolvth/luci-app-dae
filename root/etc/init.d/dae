@@ -13,8 +13,25 @@ readonly LOG="/var/log/dae/dae.log"
 EXTRA_COMMANDS="reload_config"
 EXTRA_HELP="        reload_config   Reload $NAME config"
 
+ensure_uci_config() {
+    [ ! -f /etc/config/dae ] && touch /etc/config/dae
+    if ! uci -q get dae.settings >/dev/null 2>&1; then
+        uci set dae.settings=settings
+        uci set dae.settings.enabled='1'
+        uci set dae.settings.config_file='/etc/dae/config.dae'
+        uci set dae.settings.disable_waiting_network='0'
+        uci set dae.settings.enable_dae_log='1'
+        uci set dae.settings.logfile_maxsize='1'
+        uci set dae.settings.logfile_maxbackups='1'
+        uci commit dae
+    fi
+}
+
 start_service() {
+    ensure_uci_config
+    config_load $NAME
     mkdir -p /var/log/dae
+
     $PROG validate -c $CONF >> $LOG 2>&1 || return 1
 
     procd_open_instance $NAME
