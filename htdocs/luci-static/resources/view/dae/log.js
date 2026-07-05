@@ -33,6 +33,7 @@ return baseclass.extend({
 .log-error { color: #d73a49; font-weight: bold; } \
 .log-debug { color: #6f42c1; } \
 .log-ip { color: #22863a; font-weight: bold; } \
+.log-outbound { color: #d73a49; font-weight: bold; } \            
 .log-container { \
   padding: 2px 0; \
 } \
@@ -102,6 +103,7 @@ return baseclass.extend({
   .log-error { color: #f97583; } \
   .log-debug { color: #d2a8ff; } \
   .log-ip { color: #7ee787; } \
+  .log-outbound { color: #f97583; font-weight: bold; } \            
   #log_textarea::-webkit-scrollbar-track { \
     background: rgba(255, 255, 255, 0.03); \
   } \
@@ -146,6 +148,7 @@ return baseclass.extend({
                 .replace(/\b(debug|DEBUG)\b/g, '<span class="log-debug">$1</span>')
                 .replace(/\blevel=(error|warn|info|debug)\b/g, 'level=<span class="log-$1">$1</span>');
             line = line.replace(/(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)/g, '<span class="log-ip">$1</span>');
+            line = line.replace(/\b(outbound)\b/gi, '<span class="log-outbound">$1</span>');            
             return '<div class="log-container">' + line + '</div>';
         }
 
