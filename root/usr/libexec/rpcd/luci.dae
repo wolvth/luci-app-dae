@@ -29,14 +29,14 @@ ensure_directories() {
 # ── 确保 UCI 配置存在 ──────────────────────────────────────
 [ ! -f /etc/config/dae ] && touch /etc/config/dae
 ensure_uci_config() {
-    if ! uci -q get dae.settings >/dev/null 2>&1; then
-        uci set dae.settings=settings
-        uci set dae.settings.enabled='1'
-        uci set dae.settings.config_file='/etc/dae/config.dae'
-        uci set dae.settings.disable_waiting_network='0'
-        uci set dae.settings.enable_dae_log='1'
-        uci set dae.settings.logfile_maxsize='3'
-        uci set dae.settings.logfile_maxbackups='1'
+    if ! uci -q get dae.config >/dev/null 2>&1; then
+        uci set dae.config=config
+        uci set dae.config.enabled='1'
+        uci set dae.config.config_file='/etc/dae/config.dae'
+        uci set dae.config.disable_waiting_network='0'
+        uci set dae.config.enable_dae_log='1'
+        uci set dae.config.log_maxbackups='1'
+        uci set dae.config.log_maxsize='3'
         uci commit dae
     fi
 }
@@ -218,7 +218,7 @@ set_init_action() {
 
     case "$action" in
         enable|disable|start|stop|restart)
-			# 启动/重启前检查二进制和配置文件
+            # 启动/重启前检查二进制和配置文件	
             ensure_directories
             ensure_uci_config
             if [ "$action" = "start" ] || [ "$action" = "restart" ]; then
@@ -228,15 +228,15 @@ set_init_action() {
                     fi
                 fi
             fi
-
             if /etc/init.d/"$name" "$action" >/dev/null 2>&1; then
                 print_json_bool "result" '1'
             else
                 print_json_bool "result" '0'
             fi
             ;;
-        # --- 只保存配置，不触发 dae reload ---
+        # --- 保存配置后不操作，取消注释是reload ---
         reload_config)
+            #/etc/init.d/dae hot_reload 2>/dev/null
             print_json_bool "result" "1"
             ;;
         update)
@@ -245,7 +245,7 @@ set_init_action() {
             fi
             rm -f "$DAE_FAIL"
             ( touch "$DAE_LOCK"
-              # ---- 版本感知更新逻辑 ----
+			# ---- 版本感知更新逻辑 ----
               current_ver=$("$PROG" --version 2>/dev/null | awk 'NR==1{print $3}')
               case "$current_ver" in
                   unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
