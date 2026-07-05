@@ -133,7 +133,7 @@ check_arch() {
     echo "${GREEN}Detected architecture: $MACHINE${RESET}"
 }
 
-# ── Version helpers ─────────────────��─────────────────────
+# ── Version helpers ─────────────────────────────────────
 # POSIX version compare — no sort -V (not in busybox)
 # Returns: 0=equal  1=$1>$2  2=$1<$2
 ver_compare() {
