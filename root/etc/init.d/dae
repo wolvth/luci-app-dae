@@ -32,9 +32,9 @@ start_service() {
     config_load $NAME
     mkdir -p /var/log/dae
 
-	local enabled
-	config_get_bool enabled "config" "enabled" "0"
-	[ "$enabled" -eq "1" ] || return 1
+    local enabled
+    config_get_bool enabled "settings" "enabled" "0"
+    [ "$enabled" -eq "1" ] || return 1
 
     $PROG validate -c $CONF >> $LOG 2>&1 || return 1
 
@@ -67,7 +67,7 @@ reload_service() {
 }
 
 service_triggers() {
-    procd_add_reload_trigger $NAME
+    procd_add_reload_trigger "$NAME"
 }
 
 reload_config() {
