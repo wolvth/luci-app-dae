@@ -1,4 +1,3 @@
-// /www/luci-static/resources/dae/log.js
 'use strict';
 'require ui';
 'require fs';
@@ -9,9 +8,8 @@
 const LOG = '/var/log/dae/dae.log';
 
 return baseclass.extend({
-getRuntimeLog: function() {
-
-var css = '\
+    getRuntimeLog: function () {
+        var css = '\
 #log_textarea { \
   text-align: left; \
   max-height: 70vh; \
@@ -134,179 +132,215 @@ var css = '\
   } \
 }';
 
-var log_textarea = E('div', {'id': 'log_textarea'},
-    E('img', {'src': L.resource('icons/loading.gif'), 'alt': _('Loading...'), 'style': 'vertical-align:middle'},
-    _('Collecting data…')));
+        // ★★★ 修改后的 loading 图标（使用 LuCI 内置 spinning 动画）★★★
+        var log_textarea = E('div', { 'id': 'log_textarea' },
+            E('span', { 'class': 'spinning', 'style': 'margin-right: 6px;' }, ''),
+            _('Collecting data…')
+        );
 
-function formatLogLine(line) {
-    line = line.replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    line = line.replace(/\b(error|failed)\b/g, '<span class="log-error">$1</span>')
-              .replace(/\b(warn|warning)\b/g, '<span class="log-warn">$1</span>')
-              .replace(/\b(info|INFO)\b/g, '<span class="log-info">$1</span>')
-              .replace(/\b(debug|DEBUG)\b/g, '<span class="log-debug">$1</span>')
-              .replace(/\blevel=(error|warn|info|debug)\b/g, 'level=<span class="log-$1">$1</span>');
-    line = line.replace(/(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)/g, '<span class="log-ip">$1</span>');
-    return '<div class="log-container">' + line + '</div>';
-}
+        function formatLogLine(line) {
+            line = line.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            line = line.replace(/\b(error|failed)\b/g, '<span class="log-error">$1</span>')
+                .replace(/\b(warn|warning)\b/g, '<span class="log-warn">$1</span>')
+                .replace(/\b(info|INFO)\b/g, '<span class="log-info">$1</span>')
+                .replace(/\b(debug|DEBUG)\b/g, '<span class="log-debug">$1</span>')
+                .replace(/\blevel=(error|warn|info|debug)\b/g, 'level=<span class="log-$1">$1</span>');
+            line = line.replace(/(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)/g, '<span class="log-ip">$1</span>');
+            return '<div class="log-container">' + line + '</div>';
+        }
 
-var originalLogContent = '';
-var logEntriesCache = null;
-var debounceTimeout = null;
-var isPaused = false;
+        var originalLogContent = '';
+        var logEntriesCache = null;
+        var debounceTimeout = null;
+        var isPaused = false;
 
-function debounce(func, wait) {
-    return function() {
-        var context = this, args = arguments;
-        clearTimeout(debounceTimeout);
-        debounceTimeout = setTimeout(function() { func.apply(context, args); }, wait);
-    };
-}
+        function debounce(func, wait) {
+            return function () {
+                var context = this, args = arguments;
+                clearTimeout(debounceTimeout);
+                debounceTimeout = setTimeout(function () {
+                    func.apply(context, args);
+                }, wait);
+            };
+        }
 
-function highlightFilter(text, filter) {
-    if (!filter) return text;
-    var safeFilter = filter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return text.replace(new RegExp('(' + safeFilter + ')', 'gi'),
-        '<span class="filter-highlight">$1</span>');
-}
+        function highlightFilter(text, filter) {
+            if (!filter) return text;
+            var safeFilter = filter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return text.replace(new RegExp('(' + safeFilter + ')', 'gi'), '<span class="filter-highlight">$1</span>');
+        }
 
-poll.add(L.bind(function() {
-    if (isPaused) return Promise.resolve();
-    return fs.read_direct(LOG, 'text').then(function(content) {
-        var contentLines = content.trim().split(/\r?\n/);
-        var reversedContent = contentLines.reverse();
-        var formattedLines = reversedContent.map(function(line) { return formatLogLine(line); });
-        var formattedContent = formattedLines.join('');
-        originalLogContent = formattedContent;
-        logEntriesCache = null;
-        var logContainer = E('pre', {});
-        logContainer.innerHTML = formattedContent || _('Log is empty.');
-        dom.content(log_textarea, logContainer);
-        var filterInput = document.getElementById('filterInput');
-        if (filterInput && filterInput.value) applyFilter(filterInput.value);
-    }).catch(function(e) {
-        var log;
-        if (e.toString().includes('NotFoundError'))
-            log = E('pre', {'wrap': 'pre'}, [_('Log file does not exist.')]);
-        else
-            log = E('pre', {'wrap': 'pre'}, [_('Unknown error: %s').format(e)]);
-        dom.content(log_textarea, log);
-    });
-}));
+        poll.add(L.bind(function () {
+            if (isPaused) return Promise.resolve();
 
-function cacheLogEntries() {
-    if (logEntriesCache) return logEntriesCache;
-    var logContainer = document.getElementById('log_textarea');
-    var entries = logContainer.querySelectorAll('.log-container');
-    logEntriesCache = [];
-    entries.forEach(function(entry) {
-        logEntriesCache.push({ element: entry, text: entry.textContent.toLowerCase(), originalHtml: entry.innerHTML });
-    });
-    return logEntriesCache;
-}
+            return fs.read_direct(LOG, 'text').then(function (content) {
+                var contentLines = content.trim().split(/\r?\n/);
+                var reversedContent = contentLines.reverse();
+                var formattedLines = reversedContent.map(function (line) {
+                    return formatLogLine(line);
+                });
+                var formattedContent = formattedLines.join('');
 
-function applyFilter(filter) {
-    if (!filter) {
-        var logContainer = document.getElementById('log_textarea');
-        var preElem = logContainer.querySelector('pre');
-        if (preElem) { preElem.innerHTML = originalLogContent || _('Log is empty.'); logEntriesCache = null; }
-        return;
-    }
-    filter = filter.toLowerCase();
-    var entries = cacheLogEntries();
-    requestAnimationFrame(function() {
-        entries.forEach(function(entry) {
-            if (entry.text.includes(filter)) {
-                entry.element.innerHTML = highlightFilter(entry.originalHtml, filter);
-                entry.element.style.display = '';
+                originalLogContent = formattedContent;
+                logEntriesCache = null;
+
+                var logContainer = E('pre', {});
+                logContainer.innerHTML = formattedContent || _('Log is empty.');
+                dom.content(log_textarea, logContainer);
+
+                var filterInput = document.getElementById('filterInput');
+                if (filterInput && filterInput.value)
+                    applyFilter(filterInput.value);
+
+            }).catch(function (e) {
+                var log;
+                if (e.toString().includes('NotFoundError'))
+                    log = E('pre', { 'wrap': 'pre' }, [_('Log file does not exist.')]);
+                else
+                    log = E('pre', { 'wrap': 'pre' }, [_('Unknown error: %s').format(e)]);
+
+                dom.content(log_textarea, log);
+            });
+        }));
+
+        function cacheLogEntries() {
+            if (logEntriesCache) return logEntriesCache;
+
+            var logContainer = document.getElementById('log_textarea');
+            var entries = logContainer.querySelectorAll('.log-container');
+
+            logEntriesCache = [];
+            entries.forEach(function (entry) {
+                logEntriesCache.push({
+                    element: entry,
+                    text: entry.textContent.toLowerCase(),
+                    originalHtml: entry.innerHTML
+                });
+            });
+
+            return logEntriesCache;
+        }
+
+        function applyFilter(filter) {
+            if (!filter) {
+                var logContainer = document.getElementById('log_textarea');
+                var preElem = logContainer.querySelector('pre');
+                if (preElem) {
+                    preElem.innerHTML = originalLogContent || _('Log is empty.');
+                    logEntriesCache = null;
+                }
+                return;
+            }
+
+            filter = filter.toLowerCase();
+            var entries = cacheLogEntries();
+
+            requestAnimationFrame(function () {
+                entries.forEach(function (entry) {
+                    if (entry.text.includes(filter)) {
+                        entry.element.innerHTML = highlightFilter(entry.originalHtml, filter);
+                        entry.element.style.display = '';
+                    } else {
+                        entry.element.style.display = 'none';
+                    }
+                });
+            });
+        }
+
+        function clearLog() {
+            return ui.showModal(_('Clear Log'), [
+                E('p', {}, _('Are you sure you want to clear the log file?')),
+                E('div', { class: 'right' }, [
+                    E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')),
+                    E('button', {
+                        'class': 'cbi-button cbi-button-positive important',
+                        'click': function () {
+                            ui.hideModal();
+                            fs.write(LOG, '').then(function () {
+                                ui.addNotification(_('Success'), _('Log file has been cleared.'), 'success');
+                                var logContainer = document.getElementById('log_textarea');
+                                var preElem = logContainer.querySelector('pre');
+                                if (preElem) {
+                                    preElem.innerHTML = _('Log file does not exist.');
+                                    logEntriesCache = null;
+                                    originalLogContent = '';
+                                }
+                            }).catch(function (error) {
+                                ui.addNotification(_('Error'), _('Failed to clear log file: %s').format(error), 'error');
+                            });
+                        }
+                    }, _('Clear'))
+                ])
+            ]);
+        }
+
+        var scrollDownButton = E('button', { 'id': 'scrollDownButton', 'class': 'cbi-button cbi-button-neutral' }, _('Scroll to tail'));
+        scrollDownButton.addEventListener('click', function () {
+            var lc = document.getElementById('log_textarea');
+            if (lc) lc.scrollTop = lc.scrollHeight;
+        });
+
+        var scrollUpButton = E('button', { 'id': 'scrollUpButton', 'class': 'cbi-button cbi-button-neutral' }, _('Scroll to head'));
+        scrollUpButton.addEventListener('click', function () {
+            var lc = document.getElementById('log_textarea');
+            if (lc) lc.scrollTop = 0;
+        });
+
+        var clearFilterButton = E('button', { 'id': 'clearFilterButton', 'class': 'cbi-button cbi-button-neutral' }, _('Clear Filter'));
+        var clearLogButton = E('button', { 'id': 'clearLogButton', 'class': 'cbi-button cbi-button-negative' }, _('Clear Log'));
+        clearLogButton.addEventListener('click', clearLog);
+
+        var refreshToggleButton = E('button', { 'id': 'refreshToggleButton', 'class': 'cbi-button cbi-button-neutral' }, '⏸ ' + _('Pause Refresh'));
+        refreshToggleButton.addEventListener('click', function () {
+            isPaused = !isPaused;
+            if (isPaused) {
+                refreshToggleButton.innerHTML = '▶ ' + _('Resume Refresh');
+                refreshToggleButton.className = 'cbi-button cbi-button-positive';
             } else {
-                entry.element.style.display = 'none';
+                refreshToggleButton.innerHTML = '⏸ ' + _('Pause Refresh');
+                refreshToggleButton.className = 'cbi-button cbi-button-neutral';
             }
         });
-    });
-}
 
-function clearLog() {
-    return ui.showModal(_('Clear Log'), [
-        E('p', {}, _('Are you sure you want to clear the log file?')),
-        E('div', { class: 'right' }, [
-            E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')),
-            E('button', { 'class': 'cbi-button cbi-button-positive important', 'click': function() {
-                ui.hideModal();
-                fs.write(LOG, '').then(function() {
-                    ui.addNotification(_('Success'), _('Log file has been cleared.'), 'success');
-                    var logContainer = document.getElementById('log_textarea');
-                    var preElem = logContainer.querySelector('pre');
-                    if (preElem) {
-                        preElem.innerHTML = _('Log file does not exist.');
-                        logEntriesCache = null;
-                        originalLogContent = '';
-                    }
-                }).catch(function(error) {
-                    ui.addNotification(_('Error'), _('Failed to clear log file: %s').format(error), 'error');
-                });
-            } }, _('Clear'))
-        ])
-    ]);
-}
+        var filterInput = E('input', {
+            'id': 'filterInput',
+            'type': 'text',
+            'placeholder': _('Filter logs...'),
+            'style': 'padding: 5px; border-radius: 4px; border: 1px solid #ddd; width: 200px;'
+        });
+        filterInput.addEventListener('input', debounce(function () {
+            applyFilter(this.value);
+        }, 200));
 
-var scrollDownButton = E('button', { 'id': 'scrollDownButton', 'class': 'cbi-button cbi-button-neutral' },
-    _('Scroll to tail'));
-scrollDownButton.addEventListener('click', function() {
-    var lc = document.getElementById('log_textarea');
-    if (lc) lc.scrollTop = lc.scrollHeight;
-});
+        clearFilterButton.addEventListener('click', function () {
+            var fi = document.getElementById('filterInput');
+            if (fi) {
+                fi.value = '';
+                applyFilter('');
+                logEntriesCache = null;
+            }
+        });
 
-var scrollUpButton = E('button', { 'id': 'scrollUpButton', 'class': 'cbi-button cbi-button-neutral' },
-    _('Scroll to head'));
-scrollUpButton.addEventListener('click', function() {
-    var lc = document.getElementById('log_textarea');
-    if (lc) lc.scrollTop = 0;
-});
-
-var clearFilterButton = E('button', { 'id': 'clearFilterButton', 'class': 'cbi-button cbi-button-neutral' },
-    _('Clear Filter'));
-
-var clearLogButton = E('button', { 'id': 'clearLogButton', 'class': 'cbi-button cbi-button-negative' },
-    _('Clear Log'));
-clearLogButton.addEventListener('click', clearLog);
-
-var refreshToggleButton = E('button', { 'id': 'refreshToggleButton', 'class': 'cbi-button cbi-button-neutral' },
-    '⏸ ' + _('Pause Refresh'));
-refreshToggleButton.addEventListener('click', function() {
-    isPaused = !isPaused;
-    if (isPaused) {
-        refreshToggleButton.innerHTML = '▶ ' + _('Resume Refresh');
-        refreshToggleButton.className = 'cbi-button cbi-button-positive';
-    } else {
-        refreshToggleButton.innerHTML = '⏸ ' + _('Pause Refresh');
-        refreshToggleButton.className = 'cbi-button cbi-button-neutral';
+        return E('div', {}, [
+            E('style', [css]),
+            E('div', { 'class': 'controls-container' }, [
+                E('div', { 'class': 'controls-row' }, [
+                    filterInput,
+                    clearFilterButton,
+                    refreshToggleButton
+                ]),
+                E('div', { 'class': 'controls-row' }, [
+                    scrollUpButton,
+                    scrollDownButton,
+                    clearLogButton
+                ])
+            ]),
+            E('div', { 'class': 'cbi-section' }, [
+                log_textarea,
+                E('div', { 'style': 'text-align:right; margin-top: 5px;' },
+                    E('small', {}, _('Refresh every %s seconds.').format(L.env.pollinterval))
+                )
+            ])
+        ]);
     }
-});
-
-var filterInput = E('input', {
-    'id': 'filterInput', 'type': 'text',
-    'placeholder': _('Filter logs...'),
-    'style': 'padding: 5px; border-radius: 4px; border: 1px solid #ddd; width: 200px;'
-});
-filterInput.addEventListener('input', debounce(function() { applyFilter(this.value); }, 200));
-
-clearFilterButton.addEventListener('click', function() {
-    var fi = document.getElementById('filterInput');
-    if (fi) { fi.value = ''; applyFilter(''); logEntriesCache = null; }
-});
-
-return E('div', {}, [
-    E('style', [css]),
-    E('div', { 'class': 'controls-container' }, [
-        E('div', { 'class': 'controls-row' }, [filterInput, clearFilterButton, refreshToggleButton]),
-        E('div', { 'class': 'controls-row' }, [scrollUpButton, scrollDownButton, clearLogButton])
-    ]),
-    E('div', { 'class': 'cbi-section' }, [
-        log_textarea,
-        E('div', { 'style': 'text-align:right; margin-top: 5px;' },
-            E('small', {}, _('Refresh every %s seconds.').format(L.env.pollinterval)))
-    ])
-]);
-
-}
 });
