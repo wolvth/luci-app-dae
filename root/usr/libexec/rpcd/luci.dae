@@ -234,9 +234,8 @@ set_init_action() {
                 print_json_bool "result" '0'
             fi
             ;;
-        # --- 保存配置后不操作，取消注释是reload ---
+        # --- 只保存配置，不触发 dae reload ---
         reload_config)
-            #/etc/init.d/dae hot_reload 2>/dev/null
             print_json_bool "result" "1"
             ;;
         update)
