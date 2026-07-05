@@ -19,7 +19,6 @@ readonly GEO_FAIL="${GEO_LOCK}.failed"
 . /usr/share/libubox/jshn.sh
 
 # ── 确保目录和文件存在 ─────────────────────────────────────
-[ ! -f /etc/config/dae ] && touch /etc/config/dae
 ensure_directories() {
     [ ! -d "$LOG_DIR" ] && mkdir -p "$LOG_DIR"
     [ ! -d "$CONF_DIR" ] && mkdir -p "$CONF_DIR"
@@ -28,6 +27,7 @@ ensure_directories() {
 }
 
 # ── 确保 UCI 配置存在 ──────────────────────────────────────
+[ ! -f /etc/config/dae ] && touch /etc/config/dae
 ensure_uci_config() {
     if ! uci -q get dae.settings >/dev/null 2>&1; then
         uci set dae.settings=settings
@@ -227,6 +227,7 @@ set_init_action() {
                     fi
                 fi
             fi
+
             if /etc/init.d/"$name" "$action" >/dev/null 2>&1; then
                 print_json_bool "result" '1'
             else
