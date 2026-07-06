@@ -30,7 +30,7 @@ ensure_directories() {
 [ ! -f /etc/config/dae ] && touch /etc/config/dae
 ensure_uci_config() {
     if ! uci -q get dae.config >/dev/null 2>&1; then
-        uci set dae.config=config
+        uci set dae.config=dae
         uci set dae.config.enabled='1'
         uci set dae.config.config_file='/etc/dae/config.dae'
         uci set dae.config.disable_waiting_network='0'
