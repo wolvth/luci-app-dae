@@ -1,52 +1,26 @@
-#!/bin/sh
-# dae installer — optimized for luci-app-dae RPC backend
-# Commands: install | install-prerelease | update-geoip | update-geosite
-# Based on: https://github.com/daeuniverse/dae-installer
+#!/usr/bin/env sh
+# dae installer — patched for OpenWrt / GL.iNet MT6000 (busybox ash)
+# Original: https://github.com/daeuniverse/dae-installer
 
 set -e
 
-# ── Color ──────────────────────────────────────────────────
+## ── Color ────────────────────────────────────────────────────────────────────
 if command -v tput >/dev/null 2>&1; then
     RED=$(tput setaf 1)
     GREEN=$(tput setaf 2)
+    YELLOW=$(tput setaf 3)
     RESET=$(tput sgr0)
 else
-    RED='' GREEN='' RESET=''
+    RED='' GREEN='' YELLOW='' RESET=''
 fi
 
-# ── Temporary file tracking ────────────────────────────────
-_CLEANUP_FILES=''
-_CLEANUP_DIRS=''
+## ── OS check ─────────────────────────────────────────────────────────────────
+if [ "$(uname)" != 'Linux' ]; then
+    echo "${RED}error: This script only supports Linux.${RESET}"
+    exit 1
+fi
 
-# ── Cleanup handler ────────────────────────────────────────
-cleanup() {
-    local current_dir="$1"
-    [ -n "$current_dir" ] && cd "$current_dir" 2>/dev/null || true
-    
-    # Clean up tracked files
-    if [ -n "$_CLEANUP_FILES" ]; then
-        for file in $_CLEANUP_FILES; do
-            rm -f "$file" 2>/dev/null || true
-        done
-    fi
-    
-    # Clean up tracked directories
-    if [ -n "$_CLEANUP_DIRS" ]; then
-        for dir in $_CLEANUP_DIRS; do
-            rm -rf "$dir" 2>/dev/null || true
-        done
-    fi
-}
-
-track_cleanup_file() {
-    _CLEANUP_FILES="$_CLEANUP_FILES $1"
-}
-
-track_cleanup_dir() {
-    _CLEANUP_DIRS="$_CLEANUP_DIRS $1"
-}
-
-# ── SHA256 ─────────────────────────────────────────────────
+## ── SHA256 wrapper ───────────────────────────────────────────────────────────
 SHA256SUM() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'
@@ -55,64 +29,47 @@ SHA256SUM() {
     elif command -v openssl >/dev/null 2>&1; then
         openssl dgst -sha256 "$1" | awk '{print $2}'
     else
-        echo "${RED}error: No sha256 tool found.${RESET}" >&2
+        echo "${RED}error: No sha256 tool found (sha256sum / busybox / openssl).${RESET}"
         exit 1
     fi
 }
 
-# Validate SHA256 format (64 hex characters)
-validate_sha256() {
-    local hash="$1"
-    if echo "$hash" | grep -qE '^[a-f0-9]{64}$'; then
-        return 0
+## ── Dependency check (curl + unzip) ─────────────────────────────────────────
+tool_need=''
+for tool in curl unzip; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        tool_need="$tool $tool_need"
+    fi
+done
+
+if [ -n "$tool_need" ]; then
+    echo "${YELLOW}Installing missing tools: $tool_need${RESET}"
+    if command -v opkg >/dev/null 2>&1; then
+        opkg update && opkg install $tool_need
+    elif command -v apk >/dev/null 2>&1; then
+        apk add $tool_need
+    elif command -v apt >/dev/null 2>&1; then
+        apt update && apt install -y $tool_need
     else
-        return 1
+        echo "${RED}error: Cannot install $tool_need — no known package manager.${RESET}"
+        exit 1
     fi
-}
+fi
 
-# ── Dependency check (curl + unzip) ───────────────────────
-check_dependencies() {
-    local missing_tools=''
-    
-    for tool in curl unzip; do
-        if ! command -v "$tool" >/dev/null 2>&1; then
-            missing_tools="$missing_tools $tool"
-        fi
-    done
-    
-    if [ -n "$missing_tools" ]; then
-        echo "${GREEN}Installing missing tools:$missing_tools${RESET}"
-        
-        # OpenWrt modern standard uses apk
-        if command -v apk >/dev/null 2>&1; then
-            apk add --no-cache curl unzip || {
-                echo "${RED}error: Failed to install tools with apk. Check package availability.${RESET}" >&2
-                exit 1
-            }
-        else
-            echo "${RED}error: apk package manager not found. OpenWrt installation incomplete?${RESET}" >&2
-            exit 1
-        fi
-    fi
-}
-
-# ── Architecture detection ────────────────────────────────
+## ── Architecture detection ───────────────────────────────────────────────────
 check_arch() {
     if [ -n "$MACHINE" ]; then return; fi
 
-    local arch
     arch="$(uname -m)"
-    
     case "$arch" in
         aarch64 | armv8)   MACHINE='arm64' ;;
         armv7 | armv7l)    MACHINE='armv7' ;;
         armv6l)            MACHINE='armv6' ;;
         armv5tel)          MACHINE='armv5' ;;
         x86_64 | amd64)
-            # Use word boundaries (-w) to avoid false matches
-            if grep -qw 'avx2' /proc/cpuinfo 2>/dev/null; then
+            if grep -q avx2 /proc/cpuinfo 2>/dev/null; then
                 MACHINE='x86_64_v3_avx2'
-            elif grep -qw 'sse4_2' /proc/cpuinfo 2>/dev/null; then
+            elif grep -q sse /proc/cpuinfo 2>/dev/null; then
                 MACHINE='x86_64_v2_sse'
             else
                 MACHINE='x86_64'
@@ -125,7 +82,7 @@ check_arch() {
         mips64le)          MACHINE='mips64le' ;;
         riscv64)           MACHINE='riscv64' ;;
         *)
-            echo "${RED}error: Unsupported architecture: $arch${RESET}" >&2
+            echo "${RED}error: Unsupported architecture: $arch${RESET}"
             exit 1
             ;;
     esac
@@ -133,12 +90,14 @@ check_arch() {
     echo "${GREEN}Detected architecture: $MACHINE${RESET}"
 }
 
-# ── Version helpers ─────────────────────────────────────
+## ── Version helpers ──────────────────────────────────────────────────────────
 # POSIX version compare — no sort -V (not in busybox)
 # Returns: 0=equal  1=$1>$2  2=$1<$2
 ver_compare() {
+    # Returns: 0=equal  1=$1>$2  2=$1<$2
     [ "$1" = "$2" ] && { echo 0; return; }
 
+    # dev/unstable builds always older than any proper release
     case "$1" in
         unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
             echo 2; return ;;
@@ -148,11 +107,10 @@ ver_compare() {
             echo 1; return ;;
     esac
 
-    local v1 v2
+    # Strip v prefix, strip non-numeric suffixes (rc1, beta2, etc.)
     v1="$(echo "$1" | sed 's/^v//;s/[a-zA-Z].*//' )"
     v2="$(echo "$2" | sed 's/^v//;s/[a-zA-Z].*//' )"
 
-    local a1 b1 c1 a2 b2 c2
     a1="$(echo "$v1" | cut -d. -f1)"; a1="${a1:-0}"
     b1="$(echo "$v1" | cut -d. -f2)"; b1="${b1:-0}"
     c1="$(echo "$v1" | cut -d. -f3)"; c1="${c1:-0}"
@@ -161,7 +119,6 @@ ver_compare() {
     c2="$(echo "$v2" | cut -d. -f3)"; c2="${c2:-0}"
 
     for pair in "${a1}:${a2}" "${b1}:${b2}" "${c1}:${c2}"; do
-        local n1 n2
         n1="${pair%%:*}"; n2="${pair##*:}"
         [ "$n1" -gt "$n2" ] 2>/dev/null && { echo 1; return; }
         [ "$n1" -lt "$n2" ] 2>/dev/null && { echo 2; return; }
@@ -169,305 +126,430 @@ ver_compare() {
     echo 0
 }
 
-# ── Version check ─────────────────────────────────────────
-get_local_version() {
-    current_version='0'
+check_local_version() {
+    echo "${GREEN}[1/4] Checking local dae version...${RESET}"
     if command -v /usr/bin/dae >/dev/null 2>&1; then
         current_version=$(/usr/bin/dae --version 2>/dev/null | awk 'NR==1{print $3}')
+        echo "${GREEN}      Local version : ${current_version}${RESET}"
+    else
+        echo "${YELLOW}      dae not installed yet.${RESET}"
     fi
     current_version="${current_version:-0}"
 }
 
-get_remote_version() {
-    # Always fetch latest release including pre-releases
-    local api_url='https://api.github.com/repos/daeuniverse/dae/releases?per_page=1'
-    
-    local tmp
+check_online_version() {
+    if [ "$allow_prereleases" = 'yes' ]; then
+        api_url='https://api.github.com/repos/daeuniverse/dae/releases?per_page=1'
+        echo "${GREEN}[2/4] Fetching latest release (including pre-releases)...${RESET}"
+    else
+        api_url='https://api.github.com/repos/daeuniverse/dae/releases/latest'
+        echo "${GREEN}[2/4] Fetching latest stable release...${RESET}"
+    fi
+
     tmp="$(mktemp /tmp/dae.XXXXXX)"
-    track_cleanup_file "$tmp"
-    
     if ! curl -sf "$api_url" -o "$tmp"; then
-        echo "${RED}error: Failed to fetch release info from GitHub API.${RESET}" >&2
-        return 1
+        echo "${RED}error: Failed to fetch release info from GitHub API.${RESET}"
+        rm -f "$tmp"; exit 1
     fi
 
     latest_version="$(grep '"tag_name"' "$tmp" | head -n1 | \
         sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
+    rm -f "$tmp"
 
     if [ -z "$latest_version" ]; then
-        echo "${RED}error: Could not parse latest version.${RESET}" >&2
-        return 1
+        echo "${RED}error: Could not parse latest version.${RESET}"
+        exit 1
     fi
+    echo "${GREEN}      Remote version: ${latest_version}${RESET}"
 }
 
-# ── Download URLs ─────────────────────────────────────────
+compare_version() {
+    echo "${GREEN}[3/4] Comparing versions...${RESET}"
+    if [ "$current_version" = "$latest_version" ]; then
+        compare_status=0
+        echo "${GREEN}      Already up-to-date.${RESET}"
+        return
+    fi
+    compare_status="$(ver_compare "$current_version" "$latest_version")"
+    case "$compare_status" in
+        1) echo "${YELLOW}      Local ($current_version) is newer than remote ($latest_version).${RESET}" ;;
+        2) echo "${GREEN}      Update available: $current_version -> $latest_version${RESET}" ;;
+    esac
+}
+
+## ── Download URLs ────────────────────────────────────────────────────────────
 get_download_urls() {
-    local _gh _raw
-    _gh="https://github.com/daeuniverse/dae/releases/download/$latest_version"
-    _raw="https://github.com/daeuniverse/dae/raw/$latest_version"
+    if [ "$use_cdn" = 'yes' ]; then
+        _gh="https://github.abskoop.workers.dev/https://github.com/daeuniverse/dae/releases/download/$latest_version"
+        _raw="https://cdn.jsdelivr.net/gh/daeuniverse/dae@$latest_version"
+    else
+        _gh="https://github.com/daeuniverse/dae/releases/download/$latest_version"
+        _raw="https://github.com/daeuniverse/dae/raw/$latest_version"
+    fi
 
     dae_url="${_gh}/dae-linux-${MACHINE}.zip"
     dae_hash_url="${_gh}/dae-linux-${MACHINE}.zip.dgst"
+    example_config_url="${_raw}/example.dae"
+    bash_completion_url="${_raw}/install/shell-completion/dae.bash"
+    zsh_completion_url="${_raw}/install/shell-completion/dae.zsh"
+    fish_completion_url="${_raw}/install/shell-completion/dae.fish"
     geoip_url='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
     geosite_url='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
 }
 
-# ── GeoIP ─────────────────────────────────────────────────
+## ── GeoIP ────────────────────────────────────────────────────────────────────
+check_share_dir() { mkdir -p /usr/share/dae; }
+
 download_geoip() {
-    local geoip_tmp
     geoip_tmp="$(mktemp -d /tmp/dae.XXXXXX)"
-    track_cleanup_dir "$geoip_tmp"
-    
-    echo "${GREEN}Downloading GeoIP...${RESET}"
-    if ! curl -L "$geoip_url" -o "$geoip_tmp/geoip.dat"; then
-        echo "${RED}error: GeoIP download failed.${RESET}" >&2
-        return 1
-    fi
-    
-    if ! curl -sL "${geoip_url}.sha256sum" -o "$geoip_tmp/geoip.dat.sha256sum"; then
-        echo "${RED}error: GeoIP checksum download failed.${RESET}" >&2
-        return 1
-    fi
-    
-    local local_hash remote_hash
+    echo "${GREEN}Downloading GeoIP from: $geoip_url${RESET}"
+    curl -L "$geoip_url" -o "$geoip_tmp/geoip.dat" || \
+        { echo "${RED}error: GeoIP download failed.${RESET}"; rm -rf "$geoip_tmp"; exit 1; }
+    curl -sL "${geoip_url}.sha256sum" -o "$geoip_tmp/geoip.dat.sha256sum" || \
+        { echo "${RED}error: GeoIP checksum download failed.${RESET}"; rm -rf "$geoip_tmp"; exit 1; }
     local_hash="$(SHA256SUM "$geoip_tmp/geoip.dat")"
     remote_hash="$(awk '{print $1}' < "$geoip_tmp/geoip.dat.sha256sum")"
-    
+    echo "${GREEN}      Checksum: $local_hash${RESET}"
     if [ "$local_hash" != "$remote_hash" ]; then
-        echo "${RED}error: GeoIP checksum mismatch. Expected: $remote_hash, Got: $local_hash${RESET}" >&2
-        return 1
+        echo "${RED}error: GeoIP checksum mismatch — local=$local_hash remote=$remote_hash${RESET}"
+        rm -rf "$geoip_tmp"; exit 1
     fi
-    
-    mkdir -p /usr/share/dae
-    cp "$geoip_tmp/geoip.dat" /usr/share/dae/ || {
-        echo "${RED}error: Failed to copy GeoIP to /usr/share/dae${RESET}" >&2
-        return 1
-    }
-    echo "${GREEN}GeoIP updated.${RESET}"
+}
+update_geoip() {
+    check_share_dir
+    cp "$geoip_tmp/geoip.dat" /usr/share/v2ray/
+    rm -rf "$geoip_tmp"
+    echo "${GREEN}GeoIP installed/updated.${RESET}"
 }
 
-# ── GeoSite ───────────────────────────────────────────────
+## ── GeoSite ──────────────────────────────────────────────────────────────────
 download_geosite() {
-    local geosite_tmp
     geosite_tmp="$(mktemp -d /tmp/dae.XXXXXX)"
-    track_cleanup_dir "$geosite_tmp"
-    
-    echo "${GREEN}Downloading GeoSite...${RESET}"
-    if ! curl -L "$geosite_url" -o "$geosite_tmp/geosite.dat"; then
-        echo "${RED}error: GeoSite download failed.${RESET}" >&2
-        return 1
-    fi
-    
-    if ! curl -sL "${geosite_url}.sha256sum" -o "$geosite_tmp/geosite.dat.sha256sum"; then
-        echo "${RED}error: GeoSite checksum download failed.${RESET}" >&2
-        return 1
-    fi
-    
-    local local_hash remote_hash
+    echo "${GREEN}Downloading GeoSite from: $geosite_url${RESET}"
+    curl -L "$geosite_url" -o "$geosite_tmp/geosite.dat" || \
+        { echo "${RED}error: GeoSite download failed.${RESET}"; rm -rf "$geosite_tmp"; exit 1; }
+    curl -sL "${geosite_url}.sha256sum" -o "$geosite_tmp/geosite.dat.sha256sum" || \
+        { echo "${RED}error: GeoSite checksum download failed.${RESET}"; rm -rf "$geosite_tmp"; exit 1; }
     local_hash="$(SHA256SUM "$geosite_tmp/geosite.dat")"
     remote_hash="$(awk '{print $1}' < "$geosite_tmp/geosite.dat.sha256sum")"
-    
+    echo "${GREEN}      Checksum: $local_hash${RESET}"
     if [ "$local_hash" != "$remote_hash" ]; then
-        echo "${RED}error: GeoSite checksum mismatch. Expected: $remote_hash, Got: $local_hash${RESET}" >&2
-        return 1
+        echo "${RED}error: GeoSite checksum mismatch — local=$local_hash remote=$remote_hash${RESET}"
+        rm -rf "$geosite_tmp"; exit 1
     fi
-    
-    mkdir -p /usr/share/dae
-    cp "$geosite_tmp/geosite.dat" /usr/share/dae/ || {
-        echo "${RED}error: Failed to copy GeoSite to /usr/share/dae${RESET}" >&2
-        return 1
-    }
-    echo "${GREEN}GeoSite updated.${RESET}"
+}
+update_geosite() {
+    check_share_dir
+    cp "$geosite_tmp/geosite.dat" /usr/share/v2ray/
+    rm -rf "$geosite_tmp"
+    echo "${GREEN}GeoSite installed/updated.${RESET}"
 }
 
-# ── dae binary ────────────────────────────────────────────
+## ── dae binary ───────────────────────────────────────────────────────────────
 download_dae() {
-    echo "${GREEN}Downloading dae ${latest_version} for ${MACHINE}...${RESET}"
-    
-    if ! curl -L "$dae_url" -o "dae-linux-${MACHINE}.zip"; then
-        echo "${RED}error: dae download failed.${RESET}" >&2
-        rm -f "dae-linux-${MACHINE}.zip"
-        return 1
-    fi
-    track_cleanup_file "dae-linux-${MACHINE}.zip"
-    
-    local local_hash
+    echo "${GREEN}[4/4] Downloading dae binary...${RESET}"
+    echo "${GREEN}      URL: $dae_url${RESET}"
+    curl -L "$dae_url" -o "dae-linux-${MACHINE}.zip" || \
+        { echo "${RED}error: dae download failed.${RESET}"; exit 1; }
     local_hash="$(SHA256SUM "dae-linux-${MACHINE}.zip")"
-    
-    if ! curl -sL "$dae_hash_url" -o "dae-linux-${MACHINE}.zip.dgst"; then
-        echo "${RED}error: checksum file download failed.${RESET}" >&2
-        return 1
-    fi
-    track_cleanup_file "dae-linux-${MACHINE}.zip.dgst"
-    
-    # Extract checksum with multiple format support
-    local remote_hash
-    remote_hash=""
-    
-    # Format 1: "hash  ./filename"
-    remote_hash="$(awk -v name="dae-linux-${MACHINE}.zip" '$0 ~ name {print $1}' "dae-linux-${MACHINE}.zip.dgst" 2>/dev/null | head -n1)"
-    
-    # Format 2: "hash  filename" (without path)
+    curl -sL "$dae_hash_url" -o "dae-linux-${MACHINE}.zip.dgst" || \
+        { echo "${RED}error: checksum file download failed.${RESET}"
+          rm -f "dae-linux-${MACHINE}.zip.dgst"; exit 1; }
+    # Try matching by filename first, then fall back to line 3
+    remote_hash="$(awk -v name="./dae-linux-${MACHINE}.zip" \
+        '$0 ~ name {print $1}' "dae-linux-${MACHINE}.zip.dgst" | head -n1)"
     if [ -z "$remote_hash" ]; then
-        remote_hash="$(awk '$NF ~ /dae-linux.*\.zip$/ {print $1}' "dae-linux-${MACHINE}.zip.dgst" 2>/dev/null | head -n1)"
+        remote_hash="$(awk 'NR==3{print $1}' "dae-linux-${MACHINE}.zip.dgst")"
     fi
-    
-    # Format 3: First line (fallback)
-    if [ -z "$remote_hash" ]; then
-        remote_hash="$(head -n1 "dae-linux-${MACHINE}.zip.dgst" 2>/dev/null | awk '{print $1}')"
-    fi
-    
-    # Validate hash format
-    if ! validate_sha256 "$remote_hash"; then
-        echo "${RED}error: Invalid or missing checksum in .dgst file. Got: $remote_hash${RESET}" >&2
-        return 1
-    fi
-    
     if [ "$local_hash" != "$remote_hash" ]; then
-        echo "${RED}error: dae checksum mismatch. Expected: $remote_hash, Got: $local_hash${RESET}" >&2
-        return 1
+        echo "${RED}error: dae checksum mismatch — local=$local_hash remote=$remote_hash${RESET}"
+        rm -f "dae-linux-${MACHINE}.zip" "dae-linux-${MACHINE}.zip.dgst"
+        exit 1
     fi
-    
-    echo "${GREEN}Checksum OK.${RESET}"
+    rm -f "dae-linux-${MACHINE}.zip.dgst"
+    echo "${GREEN}      Checksum OK.${RESET}"
 }
 
 install_dae() {
-    local tmp_dir dae_bin
-    tmp_dir="$(mktemp -d /tmp/dae.XXXXXX)" || {
-        echo "${RED}error: Failed to create temp directory.${RESET}" >&2
-        return 1
-    }
-    track_cleanup_dir "$tmp_dir"
-    
-    if ! unzip -q "dae-linux-${MACHINE}.zip" -d "$tmp_dir"; then
-        echo "${RED}error: Failed to unzip dae binary.${RESET}" >&2
-        return 1
-    fi
-    
-    # Find the binary
-    dae_bin="$(find "$tmp_dir" -name "dae-linux-${MACHINE}" -type f 2>/dev/null | head -n1)"
-    if [ -z "$dae_bin" ]; then
-        echo "${RED}error: dae binary not found in archive.${RESET}" >&2
-        return 1
-    fi
-    
-    # Backup old version if exists
-    if [ -f /usr/bin/dae ]; then
-        if ! cp /usr/bin/dae /usr/bin/dae.bak 2>/dev/null; then
-            echo "${RED}warning: Could not backup old dae binary.${RESET}" >&2
-        fi
-    fi
-    
-    # Install new version
-    if ! install -m 755 "$dae_bin" /usr/bin/dae; then
-        echo "${RED}error: Failed to install dae binary.${RESET}" >&2
-        [ -f /usr/bin/dae.bak ] && cp /usr/bin/dae.bak /usr/bin/dae
-        return 1
-    fi
-    
-    # Verify new version
-    if ! /usr/bin/dae --version >/dev/null 2>&1; then
-        echo "${RED}error: Installed dae binary is not executable or corrupt.${RESET}" >&2
-        if [ -f /usr/bin/dae.bak ]; then
-            cp /usr/bin/dae.bak /usr/bin/dae
-            echo "${GREEN}Reverted to previous version.${RESET}"
-        fi
-        return 1
-    fi
-    
-    # Clean up backup
-    rm -f /usr/bin/dae.bak 2>/dev/null || true
-    echo "${GREEN}dae installed -> /usr/bin/dae${RESET}"
+    tmp_dir="$(mktemp -d /tmp/dae.XXXXXX)"
+    echo "${GREEN}Extracting dae...${RESET}"
+    unzip -q "dae-linux-${MACHINE}.zip" -d "$tmp_dir"
+    find "$tmp_dir" -name "dae-linux-${MACHINE}" -exec cp {} /usr/bin/dae \;
+    chmod +x /usr/bin/dae
+    rm -f "dae-linux-${MACHINE}.zip"
+    rm -rf "$tmp_dir"
+    echo "${GREEN}dae installed → /usr/bin/dae${RESET}"
+    install_initd
 }
 
-# ── Version comparison and decision ────────────────────────
-check_update_needed() {
-    if [ "$current_version" = "$latest_version" ]; then
-        echo "${GREEN}Already up-to-date ($current_version).${RESET}"
-        return 1
+install_initd() {
+    if [ -f /etc/init.d/dae ]; then
+        echo "${GREEN}init.d/dae already exists, skipping.${RESET}"
+        return
     fi
-    
-    local compare_result
-    compare_result="$(ver_compare "$current_version" "$latest_version")"
-    
-    case "$compare_result" in
-        0)
-            echo "${GREEN}Already up-to-date.${RESET}"
-            return 1
-            ;;
-        1)
-            echo "${GREEN}Local version ($current_version) is newer than remote ($latest_version).${RESET}"
-            return 1
-            ;;
-        2)
-            echo "${GREEN}Update available: $current_version -> $latest_version${RESET}"
-            return 0
-            ;;
+    echo "${GREEN}Installing /etc/init.d/dae...${RESET}"
+    mkdir -p /var/log/dae
+    cat > /etc/init.d/dae << 'INITD'
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+
+START=99
+STOP=10
+
+readonly NAME="dae"
+readonly PROG="/usr/bin/dae"
+readonly CONF="/etc/dae/config.dae"
+readonly LOG="/var/log/dae/dae.log"
+
+EXTRA_COMMANDS="reload_config"
+EXTRA_HELP="        reload_config   Reload $NAME config"
+
+start_service() {
+    config_load $NAME
+
+    mkdir -p /var/log/dae
+    $PROG validate -c $CONF >> $LOG 2>&1 || return 1
+
+    procd_open_instance $NAME
+        procd_set_param command $PROG
+        procd_append_param command run --logfile $LOG -c $CONF
+
+        local size
+        size=$(uci -q get ${NAME}.config.logfile_maxsize)
+        size="${size:-1}"
+        if [ -n "$size" ] && [ "$size" -gt 0 ]; then
+            procd_append_param command --logfile-maxsize $size
+        fi
+
+        procd_set_param limits core="unlimited"
+        procd_set_param limits nofile="1000000 1000000"
+        procd_set_param respawn
+        procd_set_param stderr 1
+
+    procd_close_instance
+}
+
+restart() {
+    stop
+    start
+}
+
+reload_service() {
+    stop
+    start
+}
+
+service_triggers() {
+    procd_add_reload_trigger $NAME
+}
+
+reload_config() {
+    $PROG reload
+}
+INITD
+    chmod +x /etc/init.d/dae
+    echo "${GREEN}init.d/dae installed.${RESET}"
+}
+
+## ── Config / completions ─────────────────────────────────────────────────────
+download_example_config() {
+    mkdir -p /etc/dae
+    echo "${GREEN}Downloading example config...${RESET}"
+    curl -sL "$example_config_url" -o /etc/dae/example.dae || notify_example='yes'
+}
+
+download_completions() {
+    if command -v bash >/dev/null 2>&1; then
+        mkdir -p /usr/share/bash-completion/completions
+        curl -sL "$bash_completion_url" -o /usr/share/bash-completion/completions/dae \
+            || echo "${YELLOW}bash completion download failed (non-fatal).${RESET}"
+    fi
+    if command -v zsh >/dev/null 2>&1; then
+        mkdir -p /usr/share/zsh/site-functions
+        curl -sL "$zsh_completion_url" -o /usr/share/zsh/site-functions/_dae \
+            || echo "${YELLOW}zsh completion download failed (non-fatal).${RESET}"
+    fi
+    if command -v fish >/dev/null 2>&1; then
+        mkdir -p /usr/share/fish/vendor_completions.d
+        curl -sL "$fish_completion_url" -o /usr/share/fish/vendor_completions.d/dae.fish \
+            || echo "${YELLOW}fish completion download failed (non-fatal).${RESET}"
+    fi
+}
+
+## ── Service (procd-first, systemd fallback) ──────────────────────────────────
+stop_dae() {
+    dae_stopped=''
+    if [ -f /etc/init.d/dae ] && [ -f /run/dae.pid ] && [ -s /run/dae.pid ]; then
+        echo "${GREEN}Stopping dae (procd)...${RESET}"
+        /etc/init.d/dae stop && dae_stopped='1'
+    elif command -v systemctl >/dev/null 2>&1 && \
+         [ "$(systemctl is-active dae 2>/dev/null)" = 'active' ]; then
+        echo "${GREEN}Stopping dae (systemd)...${RESET}"
+        systemctl stop dae && dae_stopped='1'
+    fi
+}
+
+start_dae() {
+    if [ "$dae_stopped" = '1' ] && [ -f /etc/init.d/dae ]; then
+        echo "${GREEN}Starting dae...${RESET}"
+        if /etc/init.d/dae start; then
+            echo "${GREEN}dae started.${RESET}"
+        else
+            echo "${RED}Failed to start dae — check /etc/dae/config.dae${RESET}"
+        fi
+    fi
+}
+
+## ── Banner ───────────────────────────────────────────────────────────────────
+echo_dae() {
+    cat <<EOF
+
+   __| | __ _  ___       Copyright (C) $(date +%Y)@daeuniverse
+  / \` |/ _\` |/ _ \\      https://github.com/daeuniverse/dae
+ | (_| | (_| |  __/      Licensed under AGPL-3.0
+  \\__,_|\\__,_|\\___|
+
+This software comes with ABSOLUTELY NO WARRANTY.
+EOF
+}
+
+## ── Post-install notices ─────────────────────────────────────────────────────
+notice_installed_tool() {
+    if [ -n "$tool_need" ]; then
+        echo "${GREEN}Installed during setup: $tool_need${RESET}"
+        echo "${GREEN}You may remove them if no longer needed.${RESET}"
+    fi
+}
+
+notify_configuration() {
+    echo '--------------------------------------------------------------------'
+    if [ "$notify_example" = 'yes' ]; then
+        echo "${YELLOW}warning: Example config not downloaded.${RESET}"
+        echo "${YELLOW}  https://github.com/daeuniverse/dae/raw/$latest_version/example.dae${RESET}"
+        echo '--------------------------------------------------------------------'
+    fi
+    echo "${GREEN}Installed version: $latest_version${RESET}"
+    echo '--------------------------------------------------------------------'
+    if command -v service >/dev/null 2>&1; then
+        echo "${GREEN}Start:  service dae start${RESET}"
+        echo "${GREEN}Enable: service dae enable${RESET}"
+    else
+        echo "${YELLOW}No init script found — write a procd service manually.${RESET}"
+    fi
+    echo '--------------------------------------------------------------------'
+    echo "${GREEN}Config: /etc/dae/config.dae${RESET}"
+    echo "${GREEN}Secure: chmod 600 /etc/dae/config.dae${RESET}"
+    echo '--------------------------------------------------------------------'
+}
+
+## ── Full installation ────────────────────────────────────────────────────────
+installation() {
+    echo_dae
+    download_dae
+    download_geoip
+    download_geosite
+    download_example_config
+    download_completions
+    stop_dae
+    install_dae
+    update_geoip
+    update_geosite
+    start_dae
+    notice_installed_tool
+    notify_configuration
+}
+
+should_we_install_dae() {
+    check_arch
+    if [ "$force_install" = 'yes' ]; then
+        check_online_version
+        current_version='0'
+    else
+        check_local_version
+        check_online_version
+    fi
+    compare_version
+    get_download_urls
+
+    case "$compare_status" in
+        0) echo "${GREEN}dae is up-to-date ($current_version).${RESET}"
+           notice_installed_tool ;;
+        1) echo "${YELLOW}Local $current_version > remote $latest_version.${RESET}"
+           echo "${GREEN}Use force-install to override.${RESET}" ;;
+        2) if [ "$current_version" = '0' ]; then
+               echo "${GREEN}Installing dae $latest_version...${RESET}"
+           else
+               echo "${GREEN}Upgrading dae $current_version → $latest_version...${RESET}"
+           fi
+           installation ;;
     esac
-    return 1
 }
 
-# ── Internal helpers ──────────────────────────────────────
-_do_install() {
-    get_download_urls || return 1
-    download_dae || return 1
-    install_dae || return 1
+## ── Help ─────────────────────────────────────────────────────────────────────
+show_helps() {
+    cat <<EOF
+Usage: $0 [command]
+
+Commands:
+  install                install/update dae  (default)
+  install-prerelease     include pre-release versions
+  force-install          skip version check, reinstall
+  update-geoip           update GeoIP database only
+  update-geosite         update GeoSite database only
+  use-cdn                use Cloudflare/jsDelivr CDN mirrors
+  help                   show this message
+EOF
 }
 
-_do_update_geo() {
-    get_download_urls || return 1
-    download_geoip || return 1
-    download_geosite || return 1
-}
-
-# ── Entry point ───────────────────────────────────────────
+## ── Entry point ──────────────────────────────────────────────────────────────
 current_dir="$(pwd)"
-cd /tmp || exit 1
-trap 'cleanup "$current_dir"' EXIT INT TERM
+cd /tmp || { echo "${YELLOW}Cannot cd to /tmp${RESET}"; exit 1; }
+trap 'cd "$current_dir"' EXIT INT TERM
 
-# Check dependencies at start
-check_dependencies
+if [ $# -eq 0 ]; then
+    # Default behavior for "install/update" should follow stable releases.
+    # Pre-releases are enabled only via explicit "install-prerelease".
+    allow_prereleases=''
+    should_we_install_dae
+    exit 0
+fi
 
-case "$1" in
-    install)
-        check_arch
-        get_local_version
-        get_remote_version || exit 1
-        check_update_needed && _do_install
-        ;;
-    install-prerelease)
-        # For official versions (not action/unstable), check if update is available
-        check_arch
-        get_local_version
-        
-        # Check if current version is an official/normal version (not action/dev)
-        case "$current_version" in
-            unstable-*|dev-*|nightly-*|snapshot-*|ci-*)
-                # This is an action build version - should not reach here
-                # (handled by luci.dae caller which uses updae_from_actions.sh)
-                echo "${GREEN}Current version is special build ($current_version).${RESET}"
-                echo "${GREEN}Use updae_from_actions.sh for updates.${RESET}"
-                exit 0
-                ;;
-            *)
-                # Normal official version - fetch latest pre-release and compare
-                get_remote_version || exit 1
-                check_update_needed && _do_install
-                ;;
-        esac
-        ;;
-    update-geoip)
-        check_arch
-        get_download_urls || exit 1
-        download_geoip || exit 1
-        ;;
-    update-geosite)
-        check_arch
-        get_download_urls || exit 1
-        download_geosite || exit 1
-        ;;
-    *)
-        echo "Usage: $0 {install|install-prerelease|update-geoip|update-geosite}" >&2
-        exit 1
-        ;;
-esac
+show_help='' error_help='' normal_install='' force_install=''
+allow_prereleases='' use_cdn=''
+geoip_should_update='' geosite_should_update=''
+
+for arg in "$@"; do
+    case "$arg" in
+        install)                        normal_install='yes' ;;
+        install-prerelease | \
+        install-prereleases)            allow_prereleases='yes' ;;
+        force-install)                  force_install='yes' ;;
+        use-cdn)                        use_cdn='yes' ;;
+        update-geoip)                   geoip_should_update='yes' ;;
+        update-geosite)                 geosite_should_update='yes' ;;
+        help)                           show_help='yes' ;;
+        *) echo "${RED}error: Unknown command: $arg${RESET}"; error_help='yes' ;;
+    esac
+done
+
+if [ "$show_help" = 'yes' ] || [ "$error_help" = 'yes' ]; then
+    show_helps
+    [ "$error_help" = 'yes' ] && exit 1
+    exit 0
+fi
+
+if [ "$force_install" = 'yes' ] || [ "$normal_install" = 'yes' ] || \
+   [ "$allow_prereleases" = 'yes' ]; then
+    should_we_install_dae
+fi
+
+if [ "$geoip_should_update" = 'yes' ]; then
+    check_arch; get_download_urls
+    download_geoip; update_geoip
+fi
+
+if [ "$geosite_should_update" = 'yes' ]; then
+    check_arch; get_download_urls
+    download_geosite; update_geosite
+fi
