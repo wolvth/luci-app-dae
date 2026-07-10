@@ -86,10 +86,14 @@ RPC.on("setInitAction", function(reply) {
 var statsPoller = {
 	timer: null,
 	el: null,
+	prev: null, // 新增：用于保存上一次的数据
 
 	start: function(el) {
+		this.stop(); // 修复上次提到的重复定时器问题
 		this.el = el;
+		this.prev = null; // 每次重新开始时重置
 		var self = this;
+		
 		function tick() {
 			L.resolveDefault(getProcessStats(), {}).then(function(data) {
 				self.update(data);
@@ -108,12 +112,33 @@ var statsPoller = {
 		var running = s && (s.running === true || s.running === 1);
 		if (!running) {
 			this.el.textContent = '';
+			this.prev = null;
 			return;
 		}
-		var cpu = (s.cpu_percent || '0') + '%';
+
+		// --- CPU 计算逻辑 (JS 处理) ---
+		var cpu_percent = "0.0";
+		if (this.prev && s.utime) {
+			var delta_cpu = (parseInt(s.utime) + parseInt(s.stime)) - (parseInt(this.prev.utime) + parseInt(this.prev.stime));
+			// 系统时间(秒)差值 * 时钟频率 = 系统滴答差值
+			var delta_time = (parseFloat(s.system_uptime) - parseFloat(this.prev.system_uptime)) * parseInt(s.clk_tck);
+			var num_cpu = parseInt(s.num_cpu) || 1;
+
+			if (delta_time > 0) {
+				var pct = (delta_cpu * 100 / delta_time / num_cpu);
+				if (pct > 100) pct = 100;
+				if (pct < 0) pct = 0;
+				cpu_percent = pct.toFixed(1); // 保留一位小数，例如 12.3%
+			}
+		}
+		this.prev = s; // 将当前数据保存，留给下一次计算用
+		// -----------------------------
+
+		var cpu = cpu_percent + '%';
 		var rss = formatMem(s.mem_rss_kb, s.mem_rss_mb);
-		var threads = (s.threads || '0') + ' ' + _('threads');
+		var threads = _("%s threads").format(s.threads || '0');
 		var uptime = s.uptime || '-';
+		
 		this.el.innerHTML = '  |  CPU <b style="color:#3498db">' + cpu + '</b>' +
 			'  |  RSS <b style="color:#e67e22">' + rss + '</b>' +
 			'  |  <b style>' + threads + '</b>' +
