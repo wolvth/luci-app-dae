@@ -128,8 +128,8 @@ jobs:
           sudo apt-get install -y \
             build-essential clang flex bison g++ gawk \
             gcc-multilib g++-multilib gettext git libelf-dev \
-            libncurses-dev libssl-dev python3-distutils rsync \
-            unzip zlib1g-dev file wget swig python3-pip
+            libncurses5-dev libssl-dev rsync zlib1g-dev\
+            unzip zlib1g-dev file wget swig python3-setuptools
 
       - name: 获取 OpenWrt 源码
         run: |
