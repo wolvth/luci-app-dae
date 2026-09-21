@@ -1,0 +1,281 @@
+name: Build OpenWrt Plugins
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWrt 版本标签'
+        required: false
+        default: 'v25.12.5'
+        type: string
+      config_file:
+        description: '插件配置文件路径'
+        required: false
+        default: 'plugins.conf'
+        type: string
+      extra_packages:
+        description: '额外包名（空格分隔，如 luci-app-ddns luci-app-samba4）'
+        required: false
+        default: ''
+        type: string
+      build_firmware:
+        description: '是否编译完整固件（否=只编译插件ipk）'
+        required: false
+        default: false
+        type: boolean
+      use_cache:
+        description: '是否使用编译缓存（加速二次编译）'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  # ========================================
+  # 第1步：解析配置
+  # ========================================
+  parse-config:
+    runs-on: ubuntu-24.04
+    outputs:
+      packages: ${{ steps.parse.outputs.packages }}
+      feeds: ${{ steps.parse.outputs.feeds }}
+      target_config: ${{ steps.parse.outputs.target_config }}
+      has_packages: ${{ steps.parse.outputs.has_packages }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse plugins.conf
+        id: parse
+        run: |
+          CONFIG_FILE="${{ inputs.config_file || 'plugins.conf' }}"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::配置文件 $CONFIG_FILE 不存在"
+            exit 1
+          fi
+
+          # 解析 TARGET 行 → 写入 config
+          target_config=""
+          while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ ^TARGET[[:space:]]+(.*) ]]; then
+              target_config="${target_config}${BASH_REMATCH[1]}"$'\n'
+            fi
+          done < "$CONFIG_FILE"
+          target_config=$(echo "$target_config" | sed '/^$/d')
+          echo "target_config<<DELIM" >> "$GITHUB_OUTPUT"
+          echo "$target_config" >> "$GITHUB_OUTPUT"
+          echo "DELIM" >> "$GITHUB_OUTPUT"
+
+          # 解析 FEED 行
+          feeds=""
+          while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ ^FEED[[:space:]]+([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]*(.*) ]]; then
+              name="${BASH_REMATCH[1]}"
+              url="${BASH_REMATCH[2]}"
+              branch=$(echo "${BASH_REMATCH[3]}" | xargs)
+              feeds="${feeds}${name}|${url}|${branch}"$'\n'
+            fi
+          done < "$CONFIG_FILE"
+          feeds=$(echo "$feeds" | sed '/^$/d')
+          echo "feeds<<DELIM" >> "$GITHUB_OUTPUT"
+          echo "$feeds" >> "$GITHUB_OUTPUT"
+          echo "DELIM" >> "$GITHUB_OUTPUT"
+
+          # 解析 PACKAGE 行
+          packages=""
+          while IFS= read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$line" ]] && continue
+            if [[ "$line" =~ ^PACKAGE[[:space:]]+(.*) ]]; then
+              pkg="${BASH_REMATCH[1]}"
+              packages="${packages} ${pkg}"
+            fi
+          done < "$CONFIG_FILE"
+          packages=$(echo "$packages" | xargs)
+
+          # 追加额外包
+          extra="${{ inputs.extra_packages }}"
+          if [ -n "$extra" ]; then
+            packages="${packages} ${extra}"
+          fi
+          packages=$(echo "$packages" | xargs)
+
+          echo "packages=${packages}" >> "$GITHUB_OUTPUT"
+          echo "has_packages=$([ -n "$packages" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+          echo "### 📋 解析结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 项目 | 值 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-----|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 包 | \`${packages}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Feed 数 | $(echo "$feeds" | grep -c '|' || echo 0) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| 目标 | $(echo "$target_config" | grep TARGET | head -1) |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ========================================
+  # 第2步：编译
+  # ========================================
+  build:
+    runs-on: ubuntu-24.04
+    needs: parse-config
+    if: needs.parse-config.outputs.has_packages == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libelf-dev \
+            libncurses-dev libssl-dev python3-distutils rsync \
+            unzip zlib1g-dev file wget swig python3-pip
+
+      - name: 获取 OpenWrt 源码
+        run: |
+          VERSION="${{ inputs.openwrt_version || 'v25.12.5' }}"
+          echo "克隆 OpenWrt ${VERSION}..."
+          git clone --depth 1 --branch "$VERSION" \
+            https://git.openwrt.org/openwrt/openwrt.git openwrt
+
+      - name: 恢复编译缓存
+        if: inputs.use_cache != false
+        uses: actions/cache@v4
+        with:
+          path: |
+            openwrt/staging_dir
+            openwrt/build_dir/host
+            openwrt/dl
+          key: openwrt-${{ inputs.openwrt_version || 'v25.12.5' }}-${{ hashFiles('plugins.conf') }}
+          restore-keys: |
+            openwrt-${{ inputs.openwrt_version || 'v25.12.5' }}-
+
+      - name: 配置 feeds 和目标设备
+        working-directory: openwrt
+        run: |
+          # 写入目标设备配置
+          TARGET_CONFIG=$(cat <<'TARGETEOF'
+          ${{ needs.parse-config.outputs.target_config }}
+          TARGETEOF
+          )
+          # 清理缩进和空行
+          TARGET_CONFIG=$(echo "$TARGET_CONFIG" | sed 's/^[[:space:]]*//' | sed '/^$/d')
+          echo "$TARGET_CONFIG" > .config
+          echo "--- 目标配置 ---"
+          cat .config
+
+          # 添加自定义 feeds
+          cp feeds.conf.default feeds.conf
+          FEEDS="${{ needs.parse-config.outputs.feeds }}"
+          if [ -n "$FEEDS" ]; then
+            while IFS='|' read -r name url branch; do
+              [ -z "$name" ] && continue
+              if [ -n "$branch" ]; then
+                echo "src-git ${name} ${url};${branch}" >> feeds.conf
+              else
+                echo "src-git ${name} ${url}" >> feeds.conf
+              fi
+              echo "✓ 添加 feed: ${name}"
+            done <<< "$FEEDS"
+          fi
+          echo "--- feeds.conf ---"
+          cat feeds.conf
+
+      - name: 更新并安装 feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 选择编译包
+        working-directory: openwrt
+        run: |
+          for pkg in ${{ needs.parse-config.outputs.packages }}; do
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+          done
+          make defconfig
+
+          echo "--- 最终选中的包 ---"
+          grep "CONFIG_PACKAGE.*=y" .config | grep -v "CONFIG_PACKAGE_lib" | head -30 || true
+          echo "..."
+          echo ""
+          echo "### 📦 编译目标" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep "CONFIG_PACKAGE.*=y" .config | grep -v "CONFIG_PACKAGE_lib" >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 下载源码包
+        working-directory: openwrt
+        run: |
+          make download -j$(nproc)
+
+      - name: 编译插件
+        working-directory: openwrt
+        run: |
+          FAILED=""
+          if [ "${{ inputs.build_firmware }}" == "true" ]; then
+            echo "=============================="
+            echo "编译完整固件..."
+            echo "=============================="
+            make -j$(nproc) || make -j1 V=s
+          else
+            for pkg in ${{ needs.parse-config.outputs.packages }}; do
+              echo "=============================="
+              echo "编译: ${pkg}"
+              echo "=============================="
+              make "package/${pkg}/compile" V=s -j$(nproc) 2>&1 || {
+                echo "::warning::${pkg} 并行编译失败，单线程重试..."
+                make "package/${pkg}/compile" V=s -j1 2>&1 || {
+                  echo "::error::${pkg} 编译失败"
+                  FAILED="${FAILED} ${pkg}"
+                }
+              }
+            done
+          fi
+
+          if [ -n "$FAILED" ]; then
+            echo ""
+            echo "### ❌ 以下包编译失败:" >> "$GITHUB_STEP_SUMMARY"
+            echo "$FAILED" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::以下包编译失败:${FAILED}"
+          fi
+
+      - name: 收集编译产物
+        if: always()
+        run: |
+          mkdir -p output
+          find openwrt/bin -name "*.ipk" -exec cp {} output/ \; 2>/dev/null || true
+          find openwrt/bin/targets -name "*.img.gz" -exec cp {} output/ \; 2>/dev/null || true
+          find openwrt/bin/targets -name "*.bin" -exec cp {} output/ \; 2>/dev/null || true
+          find openwrt/bin/targets -name "*.manifest" -exec cp {} output/ \; 2>/dev/null || true
+
+          echo "### 📁 编译产物" >> "$GITHUB_STEP_SUMMARY"
+          if ls output/* &>/dev/null; then
+            echo "| 文件 | 大小 |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|------|------|" >> "$GITHUB_STEP_SUMMARY"
+            for f in output/*; do
+              echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
+            done
+          else
+            echo "无产物" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: 上传插件
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-packages-${{ github.run_number }}
+          path: output/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 上传固件
+        if: inputs.build_firmware == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-firmware-${{ github.run_number }}
+          path: |
+            output/*.img.gz
+            output/*.bin
+            output/*.manifest
+          if-no-files-found: warn
+          retention-days: 30
